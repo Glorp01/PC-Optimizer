@@ -99,10 +99,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          mapfile -t release_assets < <(find release-assets -type f | sort)
+          if [ "${#release_assets[@]}" -eq 0 ]; then
+            echo "No release assets found"
+            exit 1
+          fi
+
           if gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" release-assets/* --clobber --repo "$GH_REPO"
+            gh release upload "$TAG_NAME" "${release_assets[@]}" --clobber --repo "$GH_REPO"
           else
-            gh release create "$TAG_NAME" release-assets/* \
+            gh release create "$TAG_NAME" "${release_assets[@]}" \
               --repo "$GH_REPO" \
               --title "PC Optimizer $TAG_NAME" \
               --notes "Desktop downloads for PC Optimizer. For Windows, use PCOptimizer-Windows-Setup.exe unless you prefer the portable zip."

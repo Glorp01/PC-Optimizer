@@ -13,7 +13,7 @@ AppPublisher=PC Optimizer
 DefaultDirName={localappdata}\Programs\PC Optimizer
 DefaultGroupName=PC Optimizer
 DisableProgramGroupPage=yes
-OutputDir=dist\installer
+OutputDir=..\..\dist\installer
 OutputBaseFilename=PCOptimizer-Windows-Setup
 Compression=lzma
 SolidCompression=yes
@@ -28,7 +28,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
 [Files]
-Source: "dist\PCOptimizer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\PCOptimizer.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\PC Optimizer"; Filename: "{app}\PCOptimizer.exe"

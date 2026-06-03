@@ -6,12 +6,19 @@ import tempfile
 import threading
 import time
 import ctypes
+import json
+import re
+import urllib.error
+import urllib.request
 from ctypes import wintypes as wt
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox as mb, ttk
 
 APP_TITLE = "PC Optimizer Panel"
+GITHUB_REPO = "Glorp01/PC-Optimizer"
+LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+WINDOWS_INSTALLER_ASSET = "PCOptimizer-Windows-Setup.exe"
 BG = "#0b0b0b"
 FG = "#d0d0d0"
 ACCENT = "#16db65"  # terminal-ish green
@@ -20,12 +27,52 @@ HEADER_FONT = ("Consolas", 12, "bold")
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+try:
+    from _build_info import APP_VERSION
+except Exception:
+    APP_VERSION = "0.0.0-dev"
+
 
 def run_hidden(args, **kwargs):
     """Run console tools from the GUI without flashing a terminal window."""
     if IS_WINDOWS and CREATE_NO_WINDOW:
         kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
     return subprocess.run(args, **kwargs)
+
+
+def github_request_json(url: str):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "PC-Optimizer-Updater",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def version_parts(version: str):
+    match = re.search(r"(\d+(?:\.\d+)*)", version or "")
+    if not match:
+        return (0,)
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def is_newer_version(latest: str, current: str) -> bool:
+    latest_parts = version_parts(latest)
+    current_parts = version_parts(current)
+    max_len = max(len(latest_parts), len(current_parts))
+    latest_parts += (0,) * (max_len - len(latest_parts))
+    current_parts += (0,) * (max_len - len(current_parts))
+    return latest_parts > current_parts
+
+
+def release_asset(release, asset_name: str):
+    for asset in release.get("assets", []):
+        if asset.get("name") == asset_name:
+            return asset
+    return None
 
 
 def humanize(n_bytes: int) -> str:
@@ -837,8 +884,8 @@ class PCOptimizerApp:
             root.attributes('-topmost', True)
         except Exception:
             pass
-        root.geometry("640x420")
-        root.minsize(620, 390)
+        root.geometry("780x460")
+        root.minsize(740, 410)
 
         # TTK style for progress bar on dark background
         style = ttk.Style(root)
@@ -936,6 +983,21 @@ class PCOptimizerApp:
         )
         self.btn_storage.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.btn_update = tk.Button(
+            btn_frame,
+            text="Update App",
+            command=self.start_update_check,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        )
+        self.btn_update.pack(side=tk.LEFT, padx=(8, 0))
+
         # Second row for advanced actions
         adv_frame = tk.Frame(self.wrap, bg=BG)
         adv_frame.pack(fill=tk.X, pady=(0, 8))
@@ -1028,7 +1090,7 @@ class PCOptimizerApp:
         # Footer
         self.footer = tk.Label(
             self.wrap,
-            text="Tip: Tasks may take a moment; watch the log.",
+            text=f"Version: {APP_VERSION} | Tip: Tasks may take a moment; watch the log.",
             bg=BG,
             fg="#808080",
             font=("Consolas", 9),
@@ -1068,6 +1130,7 @@ class PCOptimizerApp:
         self.btn_boost.configure(state=state)
         self.btn_open_temp.configure(state=state)
         self.btn_storage.configure(state=state)
+        self.btn_update.configure(state=state)
         self.btn_aggressive.configure(state=state)
         self.btn_revert.configure(state=state)
         self.btn_clear_ram.configure(state=state)
@@ -1102,6 +1165,123 @@ class PCOptimizerApp:
 
     def start_component_cleanup(self) -> None:
         threading.Thread(target=self.component_cleanup, daemon=True).start()
+
+    def start_update_check(self) -> None:
+        if not self.require_windows("Update App"):
+            return
+
+        threading.Thread(target=self.check_for_updates, daemon=True).start()
+
+    def check_for_updates(self) -> None:
+        self.set_buttons_enabled(False)
+        self.start_progress()
+        try:
+            self.write(f"> Checking for updates... Current version: {APP_VERSION}")
+            release = github_request_json(LATEST_RELEASE_API)
+            latest_tag = release.get("tag_name") or ""
+            asset = release_asset(release, WINDOWS_INSTALLER_ASSET)
+            if not latest_tag or not asset:
+                self.write("[!] Could not find a Windows installer on the latest GitHub release.")
+                self.show_message(
+                    "Update App",
+                    "The latest GitHub release does not include the Windows installer.",
+                    "warning",
+                )
+                return
+
+            if not is_newer_version(latest_tag, APP_VERSION):
+                self.write(f"> You are already on the latest release: {latest_tag}")
+                self.show_message("Update App", f"PC Optimizer is up to date.\n\nInstalled: {APP_VERSION}\nLatest: {latest_tag}")
+                return
+
+            self.root.after(0, lambda: self.prompt_update_install(release, asset, latest_tag))
+        except urllib.error.URLError as e:
+            self.write(f"[!] Update check failed: {e}")
+            self.show_message("Update App", f"Could not reach GitHub:\n{e}", "error")
+        except Exception as e:
+            self.write(f"[!] Update check failed: {e}")
+            self.show_message("Update App", f"Update check failed:\n{e}", "error")
+        finally:
+            self.stop_progress()
+            self.set_buttons_enabled(True)
+
+    def prompt_update_install(self, release, asset, latest_tag: str) -> None:
+        notes_url = release.get("html_url", f"https://github.com/{GITHUB_REPO}/releases/latest")
+        if not mb.askyesno(
+            "Update App",
+            (
+                f"A new PC Optimizer update is available.\n\n"
+                f"Installed: {APP_VERSION}\n"
+                f"Latest: {latest_tag}\n\n"
+                "Download and run the Windows installer now?"
+            ),
+        ):
+            self.write(f"> Update skipped. Release page: {notes_url}")
+            return
+
+        self.set_buttons_enabled(False)
+        self.start_progress()
+        threading.Thread(target=self.download_and_launch_update, args=(asset, latest_tag), daemon=True).start()
+
+    def download_and_launch_update(self, asset, latest_tag: str) -> None:
+        try:
+            download_url = asset.get("browser_download_url")
+            if not download_url:
+                raise RuntimeError("The release asset does not include a download URL.")
+
+            update_dir = Path(tempfile.gettempdir()) / "PCOptimizerUpdate"
+            update_dir.mkdir(parents=True, exist_ok=True)
+            installer_path = update_dir / WINDOWS_INSTALLER_ASSET
+
+            self.write(f"- Downloading {WINDOWS_INSTALLER_ASSET} from {latest_tag}...")
+            self.download_update_installer(download_url, installer_path)
+
+            self.write(f"- Launching installer: {installer_path}")
+            subprocess.Popen([str(installer_path)], cwd=str(update_dir))
+            self.write("> Installer started. PC Optimizer will close so the update can finish.")
+            self.root.after(800, self.root.destroy)
+        except Exception as e:
+            self.write(f"[!] Update install failed: {e}")
+            self.show_message("Update App", f"Update install failed:\n{e}", "error")
+            self.root.after(0, lambda: self.set_buttons_enabled(True))
+            self.root.after(0, self.stop_progress)
+
+    def download_update_installer(self, download_url: str, destination: Path) -> None:
+        request = urllib.request.Request(
+            download_url,
+            headers={"User-Agent": "PC-Optimizer-Updater"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            next_log = 5 * 1024 * 1024
+            with destination.open("wb") as output:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded >= next_log:
+                        if total:
+                            self.write(f"  downloaded {humanize(downloaded)} / {humanize(total)}")
+                        else:
+                            self.write(f"  downloaded {humanize(downloaded)}")
+                        next_log += 5 * 1024 * 1024
+
+    def show_message(self, title: str, message: str, level: str = "info") -> None:
+        def show() -> None:
+            try:
+                if level == "error":
+                    mb.showerror(title, message)
+                elif level == "warning":
+                    mb.showwarning(title, message)
+                else:
+                    mb.showinfo(title, message)
+            except Exception:
+                pass
+
+        self.root.after(0, show)
 
     def open_storage_manager(self) -> None:
         if self.storage_manager:

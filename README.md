@@ -10,6 +10,7 @@ A small Windows utility with a terminal-style Tkinter UI for cleaning temporary 
 - Clear RAM Cache: best-effort working-set trim across running processes.
 - Component Cleanup: runs `dism /Online /Cleanup-Image /StartComponentCleanup`.
 - Storage Manager: select a drive, scan folder contents, sort largest to smallest, drill into folders, open locations, and move selected items to the Recycle Bin.
+- Update App: checks the latest GitHub Release, downloads the newest Windows installer, and launches it.
 - Live UI log: shows progress and any skipped operations while tasks run.
 
 ## Requirements
@@ -68,6 +69,11 @@ git push origin v0.1.0
 ```
 
 After the workflow finishes, the files will be attached to the `v0.1.0` release.
+
+## In-App Updates
+Installed Windows copies include an `Update App` button. It checks the latest GitHub Release for `PCOptimizer-Windows-Setup.exe`; if the release tag is newer than the installed version, it downloads the installer and starts it.
+
+Each PC updates itself when the user presses the button. GitHub cannot force-update already installed copies remotely, and versions installed before the updater was added need one manual install of the newer release first.
 
 ## Notes
 - Some operations are best-effort and may skip locked files or protected system resources.

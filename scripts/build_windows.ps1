@@ -6,6 +6,17 @@ Set-Location $Root
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 
+$Version = $env:APP_VERSION
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = "0.0.0-dev"
+}
+$SafeVersion = $Version -replace "[^0-9A-Za-z._-]", ""
+if ([string]::IsNullOrWhiteSpace($SafeVersion)) {
+    $SafeVersion = "0.0.0-dev"
+}
+Set-Content -LiteralPath (Join-Path $Root "_build_info.py") -Value "APP_VERSION = '$SafeVersion'`n" -Encoding UTF8
+Write-Host "Embedding app version: $SafeVersion"
+
 python -m PyInstaller `
     --noconfirm `
     --clean `

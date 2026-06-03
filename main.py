@@ -876,6 +876,11 @@ class PCOptimizerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.storage_manager = None
+        self.update_state = "unknown"
+        self.update_check_running = False
+        self.latest_update_release = None
+        self.latest_update_asset = None
+        self.latest_update_tag = ""
         root.title(APP_TITLE)
         root.configure(bg=BG)
         try:
@@ -987,10 +992,11 @@ class PCOptimizerApp:
             btn_frame,
             text="Update App",
             command=self.start_update_check,
-            bg="#111",
-            fg=FG,
+            bg="#151515",
+            fg="#858585",
             activebackground="#1a1a1a",
-            activeforeground=FG,
+            activeforeground="#a0a0a0",
+            disabledforeground="#555",
             font=FONT,
             relief=tk.FLAT,
             padx=10,
@@ -1099,6 +1105,8 @@ class PCOptimizerApp:
 
         if not IS_WINDOWS:
             self.write("> This app is Windows-focused. Cleanup and boost actions are disabled on this OS.")
+        else:
+            self.root.after(1000, self.start_silent_update_check)
 
     # UI helpers
     def write(self, msg: str) -> None:
@@ -1170,40 +1178,121 @@ class PCOptimizerApp:
         if not self.require_windows("Update App"):
             return
 
-        threading.Thread(target=self.check_for_updates, daemon=True).start()
+        if self.update_check_running:
+            return
 
-    def check_for_updates(self) -> None:
-        self.set_buttons_enabled(False)
-        self.start_progress()
+        if self.update_state == "available" and self.latest_update_release and self.latest_update_asset:
+            self.prompt_update_install(self.latest_update_release, self.latest_update_asset, self.latest_update_tag)
+            return
+
+        threading.Thread(target=self.check_for_updates, args=(True,), daemon=True).start()
+
+    def start_silent_update_check(self) -> None:
+        if self.update_check_running:
+            return
+        threading.Thread(target=self.check_for_updates, args=(False,), daemon=True).start()
+
+    def set_update_button_state(self, state: str, latest_tag: str = "") -> None:
+        self.update_state = state
+        label_latest = latest_tag or self.latest_update_tag
+        if state == "checking":
+            config = {
+                "text": "Checking...",
+                "bg": "#151515",
+                "fg": "#858585",
+                "activebackground": "#1a1a1a",
+                "activeforeground": "#a0a0a0",
+            }
+        elif state == "current":
+            config = {
+                "text": "Up to Date",
+                "bg": "#101010",
+                "fg": "#5f5f5f",
+                "activebackground": "#151515",
+                "activeforeground": "#777",
+            }
+        elif state == "available":
+            config = {
+                "text": f"Update {label_latest}" if label_latest else "Update App",
+                "bg": "#12361f",
+                "fg": ACCENT,
+                "activebackground": "#174c2c",
+                "activeforeground": "#ffffff",
+            }
+        else:
+            config = {
+                "text": "Update App",
+                "bg": "#111",
+                "fg": FG,
+                "activebackground": "#1a1a1a",
+                "activeforeground": FG,
+            }
+
+        def apply_config() -> None:
+            try:
+                self.btn_update.configure(**config)
+            except tk.TclError:
+                pass
+
         try:
-            self.write(f"> Checking for updates... Current version: {APP_VERSION}")
+            self.root.after(0, apply_config)
+        except tk.TclError:
+            pass
+
+    def check_for_updates(self, show_dialog: bool = True) -> None:
+        self.update_check_running = True
+        self.set_update_button_state("checking")
+        if show_dialog:
+            self.set_buttons_enabled(False)
+            self.start_progress()
+        try:
+            if show_dialog:
+                self.write(f"> Checking for updates... Current version: {APP_VERSION}")
             release = github_request_json(LATEST_RELEASE_API)
             latest_tag = release.get("tag_name") or ""
             asset = release_asset(release, WINDOWS_INSTALLER_ASSET)
             if not latest_tag or not asset:
-                self.write("[!] Could not find a Windows installer on the latest GitHub release.")
-                self.show_message(
-                    "Update App",
-                    "The latest GitHub release does not include the Windows installer.",
-                    "warning",
-                )
+                self.set_update_button_state("unknown")
+                if show_dialog:
+                    self.write("[!] Could not find a Windows installer on the latest GitHub release.")
+                    self.show_message(
+                        "Update App",
+                        "The latest GitHub release does not include the Windows installer.",
+                        "warning",
+                    )
                 return
+
+            self.latest_update_release = release
+            self.latest_update_asset = asset
+            self.latest_update_tag = latest_tag
 
             if not is_newer_version(latest_tag, APP_VERSION):
-                self.write(f"> You are already on the latest release: {latest_tag}")
-                self.show_message("Update App", f"PC Optimizer is up to date.\n\nInstalled: {APP_VERSION}\nLatest: {latest_tag}")
+                self.set_update_button_state("current", latest_tag)
+                if show_dialog:
+                    self.write(f"> You are already on the latest release: {latest_tag}")
+                    self.show_message("Update App", f"PC Optimizer is up to date.\n\nInstalled: {APP_VERSION}\nLatest: {latest_tag}")
                 return
 
-            self.root.after(0, lambda: self.prompt_update_install(release, asset, latest_tag))
+            self.set_update_button_state("available", latest_tag)
+            if show_dialog:
+                self.root.after(0, lambda: self.prompt_update_install(release, asset, latest_tag))
+            else:
+                self.write(f"> Update available: {latest_tag}")
         except urllib.error.URLError as e:
-            self.write(f"[!] Update check failed: {e}")
-            self.show_message("Update App", f"Could not reach GitHub:\n{e}", "error")
+            self.set_update_button_state("unknown")
+            if show_dialog:
+                self.write(f"[!] Update check failed: {e}")
+                self.show_message("Update App", f"Could not reach GitHub:\n{e}", "error")
         except Exception as e:
-            self.write(f"[!] Update check failed: {e}")
-            self.show_message("Update App", f"Update check failed:\n{e}", "error")
+            self.set_update_button_state("unknown")
+            if show_dialog:
+                self.write(f"[!] Update check failed: {e}")
+                self.show_message("Update App", f"Update check failed:\n{e}", "error")
         finally:
-            self.stop_progress()
-            self.set_buttons_enabled(True)
+            self.update_check_running = False
+            if show_dialog:
+                self.stop_progress()
+                self.set_buttons_enabled(True)
 
     def prompt_update_install(self, release, asset, latest_tag: str) -> None:
         notes_url = release.get("html_url", f"https://github.com/{GITHUB_REPO}/releases/latest")

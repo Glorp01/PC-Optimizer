@@ -73,6 +73,8 @@ After the workflow finishes, the files will be attached to the `v0.1.0` release.
 ## In-App Updates
 Installed Windows copies include an `Update App` button. It checks the latest GitHub Release for `PCOptimizer-Windows-Setup.exe`; if the release tag is newer than the installed version, it downloads the installer and starts it.
 
+The button fades when the installed version is current and switches to a brighter update style when a newer release is available.
+
 Each PC updates itself when the user presses the button. GitHub cannot force-update already installed copies remotely, and versions installed before the updater was added need one manual install of the newer release first.
 
 ## Notes

@@ -19,6 +19,8 @@ APP_TITLE = "PC Optimizer Panel"
 GITHUB_REPO = "Glorp01/PC-Optimizer"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 WINDOWS_INSTALLER_ASSET = "PCOptimizer-Windows-Setup.exe"
+APP_EXECUTABLE_NAME = "PCOptimizer.exe"
+DEFAULT_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "Programs" / "PC Optimizer"
 BG = "#0b0b0b"
 FG = "#d0d0d0"
 ACCENT = "#16db65"  # terminal-ish green
@@ -38,6 +40,13 @@ def run_hidden(args, **kwargs):
     if IS_WINDOWS and CREATE_NO_WINDOW:
         kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
     return subprocess.run(args, **kwargs)
+
+
+def popen_hidden(args, **kwargs):
+    """Launch a helper process without flashing a console window."""
+    if IS_WINDOWS and CREATE_NO_WINDOW:
+        kwargs.setdefault("creationflags", CREATE_NO_WINDOW)
+    return subprocess.Popen(args, **kwargs)
 
 
 def github_request_json(url: str):
@@ -73,6 +82,19 @@ def release_asset(release, asset_name: str):
         if asset.get("name") == asset_name:
             return asset
     return None
+
+
+def powershell_quote(value) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def current_install_dir() -> Path:
+    if IS_WINDOWS and getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except OSError:
+            pass
+    return DEFAULT_INSTALL_DIR
 
 
 def humanize(n_bytes: int) -> str:
@@ -1302,7 +1324,8 @@ class PCOptimizerApp:
                 f"A new PC Optimizer update is available.\n\n"
                 f"Installed: {APP_VERSION}\n"
                 f"Latest: {latest_tag}\n\n"
-                "Download and run the Windows installer now?"
+                "Download and apply the update in the background now?\n"
+                "PC Optimizer will close and relaunch when the update finishes."
             ),
         ):
             self.write(f"> Update skipped. Release page: {notes_url}")
@@ -1325,15 +1348,60 @@ class PCOptimizerApp:
             self.write(f"- Downloading {WINDOWS_INSTALLER_ASSET} from {latest_tag}...")
             self.download_update_installer(download_url, installer_path)
 
-            self.write(f"- Launching installer: {installer_path}")
-            subprocess.Popen([str(installer_path)], cwd=str(update_dir))
-            self.write("> Installer started. PC Optimizer will close so the update can finish.")
-            self.root.after(800, self.root.destroy)
+            update_script = self.write_update_script(update_dir, installer_path)
+            self.write("> Applying update in the background. PC Optimizer will close and relaunch when finished.")
+            popen_hidden(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(update_script),
+                ],
+                cwd=str(update_dir),
+            )
+            self.root.after(600, self.root.destroy)
         except Exception as e:
             self.write(f"[!] Update install failed: {e}")
             self.show_message("Update App", f"Update install failed:\n{e}", "error")
             self.root.after(0, lambda: self.set_buttons_enabled(True))
             self.root.after(0, self.stop_progress)
+
+    def write_update_script(self, update_dir: Path, installer_path: Path) -> Path:
+        script_path = update_dir / "apply_pc_optimizer_update.ps1"
+        install_dir = current_install_dir()
+        app_exe = install_dir / APP_EXECUTABLE_NAME
+        log_path = update_dir / "installer.log"
+        current_pid = os.getpid()
+
+        script = f"""$ErrorActionPreference = "Stop"
+$AppPid = {current_pid}
+$Installer = {powershell_quote(installer_path)}
+$InstallDir = {powershell_quote(install_dir)}
+$AppExe = {powershell_quote(app_exe)}
+$LogPath = {powershell_quote(log_path)}
+
+try {{
+    Wait-Process -Id $AppPid -Timeout 90 -ErrorAction SilentlyContinue
+}} catch {{
+}}
+
+$arguments = @(
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    ('/DIR="' + $InstallDir + '"'),
+    ('/LOG="' + $LogPath + '"')
+)
+
+$process = Start-Process -FilePath $Installer -ArgumentList $arguments -Wait -PassThru
+if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
+    Start-Process -FilePath $AppExe -WorkingDirectory $InstallDir
+}}
+"""
+        script_path.write_text(script, encoding="utf-8")
+        return script_path
 
     def download_update_installer(self, download_url: str, destination: Path) -> None:
         request = urllib.request.Request(

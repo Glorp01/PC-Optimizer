@@ -20,15 +20,18 @@ Write-Host "Embedding app version: $SafeVersion"
 python -m PyInstaller `
     --noconfirm `
     --clean `
-    --onefile `
+    --onedir `
     --windowed `
     --name PCOptimizer `
     --specpath build `
     main.py
 
 $PackageDir = Join-Path $Root "dist\PCOptimizer-Windows-Portable"
+if (Test-Path -LiteralPath $PackageDir) {
+    Remove-Item -LiteralPath $PackageDir -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
-Copy-Item -Path (Join-Path $Root "dist\PCOptimizer.exe") -Destination $PackageDir -Force
+Copy-Item -Path (Join-Path $Root "dist\PCOptimizer\*") -Destination $PackageDir -Recurse -Force
 Copy-Item -Path (Join-Path $Root "README.md") -Destination $PackageDir -Force
 
 $ZipPath = Join-Path $Root "dist\PCOptimizer-Windows-Portable.zip"
@@ -38,5 +41,5 @@ if (Test-Path -LiteralPath $ZipPath) {
 
 Compress-Archive -Path (Join-Path $PackageDir "*") -DestinationPath $ZipPath
 
-Write-Host "Built dist\PCOptimizer.exe"
+Write-Host "Built dist\PCOptimizer\PCOptimizer.exe"
 Write-Host "Built dist\PCOptimizer-Windows-Portable.zip"

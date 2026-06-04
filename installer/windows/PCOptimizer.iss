@@ -20,6 +20,8 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\PCOptimizer.exe
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -27,8 +29,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
-Source: "..\..\dist\PCOptimizer.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\PCOptimizer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\PC Optimizer"; Filename: "{app}\PCOptimizer.exe"

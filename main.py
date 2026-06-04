@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import ctypes
+import importlib
 import json
 import re
 import urllib.error
@@ -29,10 +30,11 @@ HEADER_FONT = ("Consolas", 12, "bold")
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+APP_VERSION = "0.0.0-dev"
 try:
-    from _build_info import APP_VERSION
+    APP_VERSION = getattr(importlib.import_module("_build_info"), "APP_VERSION", APP_VERSION)
 except Exception:
-    APP_VERSION = "0.0.0-dev"
+    pass
 
 
 def run_hidden(args, **kwargs):

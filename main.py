@@ -6,7 +6,6 @@ import tempfile
 import threading
 import time
 import ctypes
-import importlib
 import csv
 import json
 import re
@@ -67,7 +66,7 @@ ASSISTANT_ACTIONS = {
 
 APP_VERSION = "0.0.0-dev"
 try:
-    APP_VERSION = getattr(importlib.import_module("_build_info"), "APP_VERSION", APP_VERSION)
+    from _build_info import APP_VERSION as APP_VERSION
 except Exception:
     pass
 

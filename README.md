@@ -10,6 +10,7 @@ A small Windows utility with a terminal-style Tkinter UI for cleaning temporary 
 - Clear RAM Cache: best-effort working-set trim across running processes.
 - Component Cleanup: runs `dism /Online /Cleanup-Image /StartComponentCleanup`.
 - Storage Manager: select a drive, scan folder contents, sort largest to smallest, drill into folders, open locations, and move selected items to the Recycle Bin.
+- AI Assistant: ask performance questions, run a read-only diagnostic scan, review likely bottlenecks, and approve or deny recommended optimizer actions.
 - Update App: checks the latest GitHub Release, downloads the newest Windows installer, and launches it.
 - Live UI log: shows progress and any skipped operations while tasks run.
 

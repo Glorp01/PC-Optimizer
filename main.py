@@ -7,6 +7,7 @@ import threading
 import time
 import ctypes
 import importlib
+import csv
 import json
 import re
 import urllib.error
@@ -29,6 +30,40 @@ FONT = ("Consolas", 10)
 HEADER_FONT = ("Consolas", 12, "bold")
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+SCAN_ENTRY_LIMIT = 25000
+
+ASSISTANT_ACTIONS = {
+    "optimize_clean": {
+        "label": "Optimize & Clean",
+        "description": "clear temp files, Recent items, and the Recycle Bin",
+    },
+    "performance_boost": {
+        "label": "Boost Performance",
+        "description": "switch to a performance-focused power plan and set AC CPU max performance to 100%",
+    },
+    "aggressive_cleanup": {
+        "label": "Aggressive Clean",
+        "description": "clear Windows Update, Delivery Optimization, thumbnails, WER, and Prefetch caches",
+    },
+    "clear_ram": {
+        "label": "Clear RAM Cache",
+        "description": "trim process working sets as a best-effort memory refresh",
+    },
+    "component_cleanup": {
+        "label": "Component Cleanup",
+        "description": "run DISM component store cleanup for superseded Windows components",
+    },
+    "storage_manager": {
+        "label": "Storage Manager",
+        "description": "open the storage scanner so you can inspect and remove large files yourself",
+    },
+    "startup_settings": {
+        "label": "Startup Apps Settings",
+        "description": "open Windows Startup Apps settings so you can disable unneeded startup entries",
+    },
+}
 
 APP_VERSION = "0.0.0-dev"
 try:
@@ -231,6 +266,393 @@ def move_to_recycle_bin(path: Path) -> None:
         raise OSError(f"Recycle Bin operation failed with code {result}")
     if operation.fAnyOperationsAborted:
         raise OSError("Recycle Bin operation was cancelled")
+
+
+def sampled_directory_size(directory: Path, max_entries: int = SCAN_ENTRY_LIMIT):
+    info = {
+        "path": directory,
+        "size": 0,
+        "entries": 0,
+        "exists": False,
+        "limited": False,
+        "errors": 0,
+    }
+    try:
+        if not directory.exists() or not directory.is_dir():
+            return info
+        info["exists"] = True
+    except OSError:
+        info["errors"] += 1
+        return info
+
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    info["entries"] += 1
+                    if info["entries"] >= max_entries:
+                        info["limited"] = True
+                        return info
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            info["size"] += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        info["errors"] += 1
+        except OSError:
+            info["errors"] += 1
+    return info
+
+
+def windows_memory_status():
+    if not IS_WINDOWS:
+        return {}
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wt.DWORD),
+            ("dwMemoryLoad", wt.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return {}
+    except Exception:
+        return {}
+
+    return {
+        "load_percent": int(status.dwMemoryLoad),
+        "total": int(status.ullTotalPhys),
+        "available": int(status.ullAvailPhys),
+    }
+
+
+def windows_uptime_seconds() -> int:
+    if not IS_WINDOWS:
+        return 0
+    try:
+        get_tick_count = ctypes.windll.kernel32.GetTickCount64
+        get_tick_count.restype = ctypes.c_ulonglong
+        return int(get_tick_count() // 1000)
+    except Exception:
+        return 0
+
+
+def active_power_plan():
+    info = {"guid": "", "name": "", "raw": "", "error": ""}
+    if not IS_WINDOWS:
+        return info
+    try:
+        res = run_hidden(["powercfg", "/GETACTIVESCHEME"], capture_output=True, text=True)
+        raw = (res.stdout or res.stderr or "").strip()
+        info["raw"] = raw
+        match = re.search(r"Power Scheme GUID:\s*([0-9a-fA-F-]+)\s*(?:\((.*?)\))?", raw)
+        if match:
+            info["guid"] = match.group(1)
+            info["name"] = (match.group(2) or "").strip()
+        elif raw:
+            info["name"] = raw
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def startup_items():
+    if not IS_WINDOWS:
+        return []
+
+    items = []
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+
+    if winreg:
+        locations = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "Current user Run"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Run", "All users Run"),
+        ]
+        for hive, subkey, label in locations:
+            try:
+                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ) as key:
+                    value_count = winreg.QueryInfoKey(key)[1]
+                    for index in range(value_count):
+                        try:
+                            name, value, _ = winreg.EnumValue(key, index)
+                            items.append({"name": name, "command": str(value), "location": label})
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+
+    startup_folders = []
+    appdata = os.environ.get("APPDATA")
+    programdata = os.environ.get("ProgramData")
+    if appdata:
+        startup_folders.append(
+            (Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup", "Current user Startup folder")
+        )
+    if programdata:
+        startup_folders.append(
+            (Path(programdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup", "All users Startup folder")
+        )
+
+    for folder, label in startup_folders:
+        try:
+            if not folder.exists():
+                continue
+            for child in folder.iterdir():
+                items.append({"name": child.name, "command": str(child), "location": label})
+        except OSError:
+            pass
+
+    return items
+
+
+def top_memory_processes(limit: int = 6):
+    if not IS_WINDOWS:
+        return []
+    try:
+        res = run_hidden(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True)
+    except Exception:
+        return []
+    if res.returncode != 0:
+        return []
+
+    processes = []
+    for row in csv.reader(res.stdout.splitlines()):
+        if len(row) < 5:
+            continue
+        memory_kb = int(re.sub(r"\D", "", row[4]) or "0")
+        processes.append({"name": row[0], "pid": row[1], "memory": memory_kb * 1024})
+    processes.sort(key=lambda item: item["memory"], reverse=True)
+    return processes[:limit]
+
+
+def build_performance_scan():
+    result = {
+        "timestamp": time.time(),
+        "metrics": {},
+        "findings": [],
+        "actions": [],
+    }
+
+    def add_action(action_key: str) -> None:
+        if action_key and action_key in ASSISTANT_ACTIONS and action_key not in result["actions"]:
+            result["actions"].append(action_key)
+
+    def add_finding(severity: str, title: str, detail: str, fix: str = "", action_key: str = "") -> None:
+        result["findings"].append(
+            {
+                "severity": severity,
+                "title": title,
+                "detail": detail,
+                "fix": fix,
+                "action": action_key,
+            }
+        )
+        add_action(action_key)
+
+    drive_root = Path(os.environ.get("SystemDrive", "C:") + "\\") if IS_WINDOWS else Path(os.path.abspath(os.sep))
+    try:
+        if not drive_root.exists():
+            drive_root = Path(Path.cwd().anchor or os.path.abspath(os.sep))
+        usage = shutil.disk_usage(str(drive_root))
+        free_percent = (usage.free / usage.total * 100) if usage.total else 0
+        result["metrics"]["drive"] = {
+            "path": str(drive_root),
+            "total": usage.total,
+            "used": usage.used,
+            "free": usage.free,
+            "free_percent": free_percent,
+        }
+        if free_percent <= 10 or usage.free <= 15 * GIB:
+            add_finding(
+                "high",
+                "Low free storage",
+                f"{drive_root} has {humanize(usage.free)} free ({free_percent:.1f}%). Low free space can slow updates, paging, and app launches.",
+                "Free space with Optimize & Clean, then inspect large folders in Storage Manager.",
+                "storage_manager",
+            )
+            add_action("optimize_clean")
+        elif free_percent <= 20 or usage.free <= 40 * GIB:
+            add_finding(
+                "medium",
+                "Storage is getting tight",
+                f"{drive_root} has {humanize(usage.free)} free ({free_percent:.1f}%). Keeping more headroom helps Windows cache and update reliably.",
+                "Run a cleanup and review large folders if the drive keeps filling up.",
+                "optimize_clean",
+            )
+    except Exception as exc:
+        result["metrics"]["drive_error"] = str(exc)
+
+    cache_specs = []
+    system_root = Path(os.environ.get("SystemRoot", "C:/Windows"))
+    programdata = os.environ.get("ProgramData")
+    localappdata = os.environ.get("LOCALAPPDATA")
+    appdata = os.environ.get("APPDATA")
+
+    cache_specs.append(("User temp", Path(tempfile.gettempdir()), "basic"))
+    cache_specs.append(("Windows temp", system_root / "Temp", "basic"))
+    if appdata:
+        cache_specs.append(("Recent items", Path(appdata) / "Microsoft" / "Windows" / "Recent", "basic"))
+    cache_specs.append(("Windows Update cache", system_root / "SoftwareDistribution" / "Download", "deep"))
+    cache_specs.append(("Prefetch cache", system_root / "Prefetch", "deep"))
+    if programdata:
+        cache_specs.append(("Delivery Optimization cache", Path(programdata) / "Microsoft" / "Windows" / "DeliveryOptimization" / "Cache", "deep"))
+    if localappdata:
+        explorer_cache = Path(localappdata) / "Microsoft" / "Windows" / "Explorer"
+        cache_specs.append(("Thumbnail cache", explorer_cache, "deep"))
+        cache_specs.append(("Windows Error Reporting", Path(localappdata) / "Microsoft" / "Windows" / "WER", "deep"))
+
+    cache_metrics = []
+    totals = {"basic": 0, "deep": 0}
+    limited = []
+    for name, path, group in cache_specs:
+        info = sampled_directory_size(path)
+        info["name"] = name
+        info["group"] = group
+        cache_metrics.append(info)
+        totals[group] += info["size"]
+        if info["limited"]:
+            limited.append(name)
+    result["metrics"]["caches"] = cache_metrics
+
+    limited_note = ""
+    if limited:
+        limited_note = f" Some folders hit the scan limit, so actual size may be higher: {', '.join(limited)}."
+
+    if totals["basic"] >= 1 * GIB:
+        add_finding(
+            "medium",
+            "Large temp file buildup",
+            f"Basic temp and recent-item caches are using about {humanize(totals['basic'])}.{limited_note}",
+            "Run Optimize & Clean to clear ordinary temp files and the Recycle Bin.",
+            "optimize_clean",
+        )
+    elif totals["basic"] >= 350 * MIB:
+        add_finding(
+            "low",
+            "Temp files are worth cleaning",
+            f"Basic temp and recent-item caches are using about {humanize(totals['basic'])}.{limited_note}",
+            "Run Optimize & Clean during a maintenance pass.",
+            "optimize_clean",
+        )
+
+    if totals["deep"] >= 2 * GIB:
+        add_finding(
+            "medium",
+            "Windows cache folders are large",
+            f"Windows Update, Delivery Optimization, thumbnails, WER, and Prefetch caches are using about {humanize(totals['deep'])}.{limited_note}",
+            "Run Aggressive Clean if you want a deeper cache cleanup.",
+            "aggressive_cleanup",
+        )
+    elif totals["deep"] >= 750 * MIB:
+        add_finding(
+            "low",
+            "Windows caches have moderate buildup",
+            f"Deep Windows cache folders are using about {humanize(totals['deep'])}.{limited_note}",
+            "Aggressive Clean can clear these if you need extra space.",
+            "aggressive_cleanup",
+        )
+
+    memory = windows_memory_status()
+    result["metrics"]["memory"] = memory
+    processes = top_memory_processes()
+    result["metrics"]["top_memory_processes"] = processes
+    if memory:
+        top_summary = ", ".join(f"{p['name']} ({humanize(p['memory'])})" for p in processes[:3])
+        process_note = f" Biggest visible memory users: {top_summary}." if top_summary else ""
+        if memory["load_percent"] >= 85 or memory["available"] <= 2 * GIB:
+            add_finding(
+                "high",
+                "Memory pressure is high",
+                f"Physical memory is {memory['load_percent']}% used with {humanize(memory['available'])} available.{process_note}",
+                "Close heavy apps first; Clear RAM Cache can request a best-effort working-set trim.",
+                "clear_ram",
+            )
+        elif memory["load_percent"] >= 75 or memory["available"] <= 4 * GIB:
+            add_finding(
+                "medium",
+                "Memory headroom is limited",
+                f"Physical memory is {memory['load_percent']}% used with {humanize(memory['available'])} available.{process_note}",
+                "Review high-memory apps and use Clear RAM Cache only as a temporary refresh.",
+                "clear_ram",
+            )
+
+    power = active_power_plan()
+    result["metrics"]["power_plan"] = power
+    plan_name = (power.get("name") or power.get("raw") or "").strip()
+    if IS_WINDOWS:
+        normalized_plan = plan_name.casefold()
+        if plan_name and not any(marker in normalized_plan for marker in ("high performance", "ultimate performance")):
+            add_finding(
+                "medium",
+                "Power plan may be limiting performance",
+                f"The active power plan appears to be: {plan_name}. Balanced or saver plans can reduce CPU responsiveness.",
+                "Use Boost Performance while plugged in, then Revert Boost later if you prefer Balanced.",
+                "performance_boost",
+            )
+        elif not plan_name:
+            add_finding(
+                "low",
+                "Power plan could not be verified",
+                "The scan could not read the active power plan.",
+                "Try Boost Performance if you want the app to request a performance-focused power plan.",
+                "performance_boost",
+            )
+
+    startup = startup_items()
+    result["metrics"]["startup_items"] = startup
+    if len(startup) >= 18:
+        add_finding(
+            "medium",
+            "Many startup entries",
+            f"{len(startup)} startup entries were found. Too many auto-starting apps can slow sign-in and consume memory.",
+            "Open Startup Apps settings and disable items you do not need at login.",
+            "startup_settings",
+        )
+    elif len(startup) >= 10:
+        add_finding(
+            "low",
+            "Startup apps may be worth reviewing",
+            f"{len(startup)} startup entries were found.",
+            "Review Startup Apps settings if boot or sign-in feels slow.",
+            "startup_settings",
+        )
+
+    uptime = windows_uptime_seconds()
+    result["metrics"]["uptime_seconds"] = uptime
+    if uptime >= 7 * 24 * 60 * 60:
+        days = uptime // (24 * 60 * 60)
+        add_finding(
+            "low",
+            "Long uptime",
+            f"Windows has been running for about {days} days. Long sessions can leave drivers, updates, and background apps in a rough state.",
+            "Restart when convenient before doing deeper troubleshooting.",
+        )
+
+    if not result["findings"]:
+        add_finding(
+            "info",
+            "No obvious performance bottleneck found",
+            "The quick scan did not find low disk space, large cache buildup, high memory pressure, or a limiting power plan.",
+            "If the PC still feels slow, check a specific app or run Storage Manager for a deeper file-by-file look.",
+        )
+
+    return result
 
 
 class StorageManager:
@@ -896,10 +1318,392 @@ class StorageManager:
             pass
 
 
+class AIAssistantWindow:
+    def __init__(self, app: "PCOptimizerApp") -> None:
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("AI Performance Assistant")
+        self.window.configure(bg=BG)
+        self.window.geometry("760x540")
+        self.window.minsize(620, 420)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.last_scan = None
+        self.scanning = False
+
+        wrap = tk.Frame(self.window, bg=BG, highlightthickness=1, highlightbackground="#222")
+        wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        header = tk.Label(wrap, text="> AI Performance Assistant", bg=BG, fg=ACCENT, font=HEADER_FONT)
+        header.pack(anchor="w")
+
+        self.chat = tk.Text(
+            wrap,
+            bg="#0f0f0f",
+            fg=FG,
+            insertbackground=ACCENT,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+            wrap=tk.WORD,
+            height=18,
+        )
+        self.chat.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        self.chat.tag_configure("assistant", foreground=FG)
+        self.chat.tag_configure("user", foreground="#9fd3ff")
+        self.chat.tag_configure("system", foreground=ACCENT)
+        self.chat.configure(state=tk.DISABLED)
+
+        input_row = tk.Frame(wrap, bg=BG)
+        input_row.pack(fill=tk.X)
+        self.prompt_var = tk.StringVar()
+        self.prompt_entry = tk.Entry(
+            input_row,
+            textvariable=self.prompt_var,
+            bg="#111",
+            fg=FG,
+            insertbackground=ACCENT,
+            relief=tk.FLAT,
+            font=FONT,
+        )
+        self.prompt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7)
+        self.prompt_entry.bind("<Return>", self.on_send)
+
+        self.send_button = tk.Button(
+            input_row,
+            text="Ask",
+            command=self.on_send,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        )
+        self.send_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        action_row = tk.Frame(wrap, bg=BG)
+        action_row.pack(fill=tk.X, pady=(8, 0))
+        self.scan_button = tk.Button(
+            action_row,
+            text="Scan PC",
+            command=self.confirm_scan,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        )
+        self.scan_button.pack(side=tk.LEFT)
+
+        self.fix_button = tk.Button(
+            action_row,
+            text="Apply Recommended Fixes",
+            command=self.on_apply_recommended,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            disabledforeground="#555",
+            font=FONT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+            state=tk.DISABLED,
+        )
+        self.fix_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.status_var = tk.StringVar(value="Ready")
+        status = tk.Label(wrap, textvariable=self.status_var, bg=BG, fg="#808080", font=("Consolas", 9))
+        status.pack(anchor="w", pady=(8, 0))
+
+        self.append_assistant(
+            "Ask what is slowing down the PC, or run a scan. I will ask before reading diagnostics and again before running any fix."
+        )
+        self.prompt_entry.focus_set()
+
+    def append_message(self, speaker: str, message: str, tag: str) -> None:
+        self.chat.configure(state=tk.NORMAL)
+        self.chat.insert(tk.END, f"{speaker}: ", tag)
+        self.chat.insert(tk.END, message.strip() + "\n\n", tag)
+        self.chat.see(tk.END)
+        self.chat.configure(state=tk.DISABLED)
+
+    def append_assistant(self, message: str) -> None:
+        self.append_message("AI", message, "assistant")
+
+    def append_user(self, message: str) -> None:
+        self.append_message("You", message, "user")
+
+    def append_system(self, message: str) -> None:
+        self.append_message("System", message, "system")
+
+    def set_scanning(self, scanning: bool) -> None:
+        self.scanning = scanning
+        state = tk.DISABLED if scanning else tk.NORMAL
+        self.scan_button.configure(state=state)
+        self.send_button.configure(state=state)
+        self.prompt_entry.configure(state=state)
+        self.status_var.set("Scanning..." if scanning else "Ready")
+        self.update_fix_button()
+
+    def update_fix_button(self) -> None:
+        has_actions = bool(self.last_scan and self.last_scan.get("actions"))
+        state = tk.NORMAL if has_actions and not self.scanning else tk.DISABLED
+        self.fix_button.configure(state=state)
+
+    def on_send(self, _event=None) -> None:
+        prompt = self.prompt_var.get().strip()
+        if not prompt:
+            return
+        self.prompt_var.set("")
+        self.append_user(prompt)
+        self.handle_prompt(prompt)
+
+    def handle_prompt(self, prompt: str) -> None:
+        lower = prompt.casefold()
+        requested_actions = self.actions_from_prompt(lower)
+        wants_action = any(word in lower for word in ("run", "apply", "fix", "clean", "clear", "enable", "switch", "start", "do it"))
+        wants_scan = any(
+            word in lower
+            for word in (
+                "scan",
+                "slow",
+                "slowing",
+                "performance",
+                "issue",
+                "wrong",
+                "bottleneck",
+                "diagnose",
+                "why",
+                "what should",
+                "what to fix",
+            )
+        )
+
+        if requested_actions and wants_action:
+            self.confirm_and_apply_actions(requested_actions)
+            return
+
+        if "fix" in lower and self.last_scan:
+            self.confirm_and_apply_actions(self.last_scan.get("actions", []))
+            return
+
+        if wants_scan:
+            self.confirm_scan()
+            return
+
+        if self.last_scan:
+            self.answer_from_scan(lower)
+            return
+
+        self.append_assistant("I need a read-only performance scan before I can give PC-specific advice.")
+        self.confirm_scan()
+
+    def actions_from_prompt(self, lower_prompt: str):
+        actions = []
+
+        def add(action_key: str) -> None:
+            if action_key not in actions:
+                actions.append(action_key)
+
+        if any(word in lower_prompt for word in ("temp", "junk", "recycle", "recent", "basic clean", "optimize")):
+            add("optimize_clean")
+        if any(word in lower_prompt for word in ("aggressive", "deep clean", "windows update cache", "delivery optimization", "prefetch")):
+            add("aggressive_cleanup")
+        if any(word in lower_prompt for word in ("boost", "power plan", "high performance", "ultimate performance")):
+            add("performance_boost")
+        if any(word in lower_prompt for word in ("ram", "memory")):
+            add("clear_ram")
+        if any(word in lower_prompt for word in ("component", "winsxs", "dism")):
+            add("component_cleanup")
+        if any(word in lower_prompt for word in ("storage", "disk", "drive", "large file")):
+            add("storage_manager")
+        if "startup" in lower_prompt:
+            add("startup_settings")
+        return actions
+
+    def confirm_scan(self) -> None:
+        if self.scanning:
+            self.append_assistant("A scan is already running.")
+            return
+        if not self.app.require_windows("AI Performance Scan"):
+            return
+
+        accepted = mb.askyesno(
+            "AI Performance Scan",
+            (
+                "Run a read-only performance scan?\n\n"
+                "I will check drive free space, temp/cache sizes, active power plan, memory pressure, "
+                "startup entries, uptime, and the largest visible memory users.\n\n"
+                "No files will be deleted and no settings will be changed."
+            ),
+            parent=self.window,
+        )
+        if not accepted:
+            self.append_system("Scan denied. No diagnostics were read.")
+            return
+
+        self.append_system("Scan accepted. Reading diagnostics only.")
+        self.set_scanning(True)
+        threading.Thread(target=self.scan_worker, daemon=True).start()
+
+    def scan_worker(self) -> None:
+        try:
+            result = build_performance_scan()
+        except Exception as exc:
+            self.post_ui(lambda exc=exc: self.scan_failed(exc))
+            return
+        self.post_ui(lambda: self.scan_finished(result))
+
+    def post_ui(self, callback) -> None:
+        try:
+            self.window.after(0, callback)
+        except tk.TclError:
+            pass
+
+    def scan_failed(self, exc: Exception) -> None:
+        self.set_scanning(False)
+        self.append_assistant(f"Scan failed: {exc}")
+
+    def scan_finished(self, result) -> None:
+        self.last_scan = result
+        self.set_scanning(False)
+        self.append_assistant(self.format_scan_report(result))
+        self.app.write(f"> AI Performance scan complete. Findings: {len(result.get('findings', []))}")
+        self.update_fix_button()
+
+    def format_scan_report(self, result) -> str:
+        lines = [
+            "I scanned storage, temp/cache folders, memory pressure, the power plan, startup entries, uptime, and high-memory processes."
+        ]
+        for finding in result.get("findings", []):
+            lines.append("")
+            lines.append(f"[{finding.get('severity', 'info').upper()}] {finding.get('title', 'Finding')}")
+            lines.append(f"  {finding.get('detail', '')}")
+            if finding.get("fix"):
+                lines.append(f"  Fix: {finding['fix']}")
+
+        actions = result.get("actions", [])
+        if actions:
+            labels = ", ".join(ASSISTANT_ACTIONS[action]["label"] for action in actions if action in ASSISTANT_ACTIONS)
+            lines.append("")
+            lines.append(f"Recommended actions I can start after you approve: {labels}.")
+        else:
+            lines.append("")
+            lines.append("No automatic optimizer action is required from this scan.")
+        return "\n".join(lines)
+
+    def answer_from_scan(self, lower_prompt: str) -> None:
+        metrics = self.last_scan.get("metrics", {}) if self.last_scan else {}
+        if any(word in lower_prompt for word in ("ram", "memory")):
+            memory = metrics.get("memory") or {}
+            processes = metrics.get("top_memory_processes") or []
+            if not memory:
+                self.append_assistant("I could not read memory pressure from the last scan.")
+                return
+            lines = [
+                f"Memory is {memory['load_percent']}% used with {humanize(memory['available'])} available out of {humanize(memory['total'])}."
+            ]
+            if processes:
+                lines.append("Largest visible memory users:")
+                for proc in processes[:5]:
+                    lines.append(f"- {proc['name']} (PID {proc['pid']}): {humanize(proc['memory'])}")
+            lines.append("Best fix: close heavy apps first; use Clear RAM Cache only as a temporary refresh.")
+            self.append_assistant("\n".join(lines))
+            return
+
+        if any(word in lower_prompt for word in ("storage", "disk", "drive", "cache", "temp")):
+            drive = metrics.get("drive") or {}
+            caches = sorted(metrics.get("caches") or [], key=lambda item: item.get("size", 0), reverse=True)
+            lines = []
+            if drive:
+                lines.append(
+                    f"{drive['path']} has {humanize(drive['free'])} free out of {humanize(drive['total'])} ({drive['free_percent']:.1f}% free)."
+                )
+            if caches:
+                lines.append("Largest cache areas from the last scan:")
+                for cache in caches[:5]:
+                    lines.append(f"- {cache['name']}: {humanize(cache['size'])}")
+            lines.append("Best fix: run Optimize & Clean for ordinary temp files, then use Storage Manager for large personal files.")
+            self.append_assistant("\n".join(lines))
+            return
+
+        if "power" in lower_prompt or "boost" in lower_prompt:
+            power = metrics.get("power_plan") or {}
+            plan = power.get("name") or power.get("raw") or "unknown"
+            self.append_assistant(
+                f"The last scan saw this active power plan: {plan}. If it is Balanced or a saver plan, Boost Performance can switch to a performance-focused plan after you approve."
+            )
+            return
+
+        if "startup" in lower_prompt or "boot" in lower_prompt:
+            startup = metrics.get("startup_items") or []
+            lines = [f"The last scan found {len(startup)} startup entries."]
+            for item in startup[:8]:
+                lines.append(f"- {item['name']} ({item['location']})")
+            lines.append("Best fix: open Startup Apps settings and disable items you do not need at login.")
+            self.append_assistant("\n".join(lines))
+            return
+
+        self.append_assistant(self.format_scan_report(self.last_scan))
+
+    def on_apply_recommended(self) -> None:
+        if not self.last_scan:
+            self.append_assistant("I need a scan before I can recommend fixes.")
+            self.confirm_scan()
+            return
+        self.confirm_and_apply_actions(self.last_scan.get("actions", []))
+
+    def confirm_and_apply_actions(self, action_keys) -> None:
+        actions = []
+        for action_key in action_keys:
+            if action_key in ASSISTANT_ACTIONS and action_key not in actions:
+                actions.append(action_key)
+
+        if not actions:
+            self.append_assistant("I do not have an automatic optimizer action for that yet. I can still scan and explain what to fix manually.")
+            return
+
+        lines = ["The AI assistant will do the following:"]
+        for action_key in actions:
+            action = ASSISTANT_ACTIONS[action_key]
+            lines.append(f"- {action['label']}: {action['description']}")
+        lines.append("")
+        lines.append("Continue?")
+
+        accepted = mb.askyesno("Apply AI Recommendation", "\n".join(lines), icon=mb.WARNING, parent=self.window)
+        if not accepted:
+            self.append_system("Fix denied. No optimizer action was started.")
+            return
+
+        self.append_system("Fix accepted. Starting approved action(s).")
+        runnable = [key for key in actions if key in ("optimize_clean", "performance_boost", "aggressive_cleanup", "clear_ram", "component_cleanup")]
+        open_actions = [key for key in actions if key in ("storage_manager", "startup_settings")]
+        if runnable:
+            self.app.start_ai_fix_plan(runnable)
+        for action_key in open_actions:
+            self.app.apply_ai_open_action(action_key)
+
+    def close(self) -> None:
+        if getattr(self.app, "ai_assistant", None) is self:
+            self.app.ai_assistant = None
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+
 class PCOptimizerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.storage_manager = None
+        self.ai_assistant = None
         self.update_state = "unknown"
         self.update_check_running = False
         self.latest_update_release = None
@@ -1032,6 +1836,21 @@ class PCOptimizerApp:
         adv_frame = tk.Frame(self.wrap, bg=BG)
         adv_frame.pack(fill=tk.X, pady=(0, 8))
 
+        self.btn_ai = tk.Button(
+            adv_frame,
+            text="AI Assistant",
+            command=self.open_ai_assistant,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=6,
+        )
+        self.btn_ai.pack(side=tk.LEFT)
+
         self.btn_aggressive = tk.Button(
             adv_frame,
             text="Aggressive Clean",
@@ -1045,7 +1864,7 @@ class PCOptimizerApp:
             padx=10,
             pady=6,
         )
-        self.btn_aggressive.pack(side=tk.LEFT)
+        self.btn_aggressive.pack(side=tk.LEFT, padx=(8, 0))
 
         self.btn_revert = tk.Button(
             adv_frame,
@@ -1163,6 +1982,7 @@ class PCOptimizerApp:
         self.btn_open_temp.configure(state=state)
         self.btn_storage.configure(state=state)
         self.btn_update.configure(state=state)
+        self.btn_ai.configure(state=state)
         self.btn_aggressive.configure(state=state)
         self.btn_revert.configure(state=state)
         self.btn_clear_ram.configure(state=state)
@@ -1197,6 +2017,36 @@ class PCOptimizerApp:
 
     def start_component_cleanup(self) -> None:
         threading.Thread(target=self.component_cleanup, daemon=True).start()
+
+    def start_ai_fix_plan(self, action_keys) -> None:
+        runnable = [
+            key
+            for key in action_keys
+            if key in ("optimize_clean", "performance_boost", "aggressive_cleanup", "clear_ram", "component_cleanup")
+        ]
+        if not runnable:
+            return
+        threading.Thread(target=self.run_ai_fix_plan, args=(runnable,), daemon=True).start()
+
+    def run_ai_fix_plan(self, action_keys) -> None:
+        labels = [ASSISTANT_ACTIONS[key]["label"] for key in action_keys if key in ASSISTANT_ACTIONS]
+        self.write(f"> AI Assistant approved fix plan: {', '.join(labels)}")
+        for action_key in action_keys:
+            try:
+                if action_key == "optimize_clean":
+                    self.optimize_clean()
+                elif action_key == "performance_boost":
+                    self.performance_boost()
+                elif action_key == "aggressive_cleanup":
+                    self.aggressive_cleanup(confirm=False)
+                elif action_key == "clear_ram":
+                    self.clear_ram_cache()
+                elif action_key == "component_cleanup":
+                    self.component_cleanup(confirm=False)
+            except Exception as exc:
+                label = ASSISTANT_ACTIONS.get(action_key, {}).get("label", action_key)
+                self.write(f"[!] AI action failed ({label}): {exc}")
+        self.write("> AI Assistant fix plan finished.")
 
     def start_update_check(self) -> None:
         if not self.require_windows("Update App"):
@@ -1442,6 +2292,17 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
 
         self.root.after(0, show)
 
+    def open_ai_assistant(self) -> None:
+        if self.ai_assistant:
+            try:
+                if self.ai_assistant.window.winfo_exists():
+                    self.ai_assistant.window.lift()
+                    self.ai_assistant.window.focus_force()
+                    return
+            except tk.TclError:
+                self.ai_assistant = None
+        self.ai_assistant = AIAssistantWindow(self)
+
     def open_storage_manager(self) -> None:
         if self.storage_manager:
             try:
@@ -1452,6 +2313,21 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
             except tk.TclError:
                 self.storage_manager = None
         self.storage_manager = StorageManager(self)
+
+    def open_startup_settings(self) -> None:
+        if not self.require_windows("Startup Apps settings"):
+            return
+        try:
+            subprocess.run(["explorer", "ms-settings:startupapps"], check=False)
+            self.write("> Opened Startup Apps settings.")
+        except Exception as e:
+            self.write(f"[!] Could not open Startup Apps settings: {e}")
+
+    def apply_ai_open_action(self, action_key: str) -> None:
+        if action_key == "storage_manager":
+            self.open_storage_manager()
+        elif action_key == "startup_settings":
+            self.open_startup_settings()
 
     def open_temp_folder(self) -> None:
         try:
@@ -1599,10 +2475,10 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
         self.write("> Revert complete. Adjust further in Power Options if desired.")
         self.set_buttons_enabled(True)
 
-    def aggressive_cleanup(self) -> None:
+    def aggressive_cleanup(self, confirm: bool = True) -> None:
         if not self.require_windows("Aggressive Clean"):
             return
-        if not mb.askyesno(
+        if confirm and not mb.askyesno(
             title="Aggressive Clean",
             message=(
                 "This will attempt to clear Windows Update cache, Delivery Optimization cache, and Prefetch.\n"
@@ -1744,10 +2620,10 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
         except Exception:
             pass
 
-    def component_cleanup(self) -> None:
+    def component_cleanup(self, confirm: bool = True) -> None:
         if not self.require_windows("Component Cleanup"):
             return
-        if not mb.askyesno(
+        if confirm and not mb.askyesno(
             title="Component Cleanup",
             message=(
                 "Run DISM component store cleanup (removes superseded updates).\n"

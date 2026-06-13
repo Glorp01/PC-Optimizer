@@ -1794,6 +1794,10 @@ class AIAssistantWindow:
             self.confirm_scan()
             return
 
+        if self.should_answer_locally_without_ai(lower):
+            self.append_assistant(self.local_assistant_response(prompt))
+            return
+
         if self.prompt_needs_scan(lower) and not self.last_scan:
             self.append_assistant("I need a read-only scan before I can answer that with your PC's actual numbers.", record=False)
             self.confirm_scan()
@@ -1823,6 +1827,14 @@ class AIAssistantWindow:
         if "startup" in lower_prompt:
             add("startup_settings")
         return actions
+
+    def should_answer_locally_without_ai(self, lower_prompt: str) -> bool:
+        return (
+            self.is_unclear_prompt(lower_prompt)
+            or self.is_greeting(lower_prompt)
+            or any(word in lower_prompt for word in ("thanks", "thank you", "ty"))
+            or any(phrase in lower_prompt for phrase in ("help", "what can you do", "commands", "questions can i ask"))
+        )
 
     def prompt_needs_scan(self, lower_prompt: str) -> bool:
         system_topics = (
@@ -1919,8 +1931,19 @@ class AIAssistantWindow:
         lower = prompt.casefold()
         metrics = self.last_scan.get("metrics", {}) if self.last_scan else {}
 
+        if self.is_unclear_prompt(lower):
+            return self.clarify_response()
+        if self.is_greeting(lower):
+            return (
+                "Hi. Ask me what you want checked, like GPU usage, CPU usage, RAM pressure, storage space, "
+                "startup apps, why games are lagging, or what to fix first."
+            )
+        if any(word in lower for word in ("thanks", "thank you", "ty")):
+            return "You're welcome. Ask me any specific PC performance question and I will answer from the latest scan when I can."
         if "what is" in lower or "explain" in lower:
             return self.explain_performance_term(lower)
+        if any(phrase in lower for phrase in ("what can you do", "help", "commands", "questions can i ask")):
+            return self.capabilities_response()
         if any(word in lower for word in ("gpu", "graphics", "vram")):
             return self.gpu_answer(metrics)
         if "cpu" in lower or "processor" in lower:
@@ -1933,19 +1956,53 @@ class AIAssistantWindow:
             return self.startup_answer(metrics)
         if "power" in lower or "boost" in lower or "battery" in lower:
             return self.power_answer(metrics)
-        if any(word in lower for word in ("game", "fps", "lag", "stutter", "slow", "bottleneck", "performance", "wrong")):
+        if any(word in lower for word in ("game", "gaming", "fps", "frames", "lag", "stutter", "slow", "bottleneck", "performance", "wrong", "issue", "problem", "fix first", "what should")):
             return self.performance_answer(metrics)
-        if "what can you do" in lower or "help" in lower:
-            return (
-                "I can help with PC performance questions, explain scan findings, and recommend fixes. "
-                "Ask about CPU, GPU, RAM, storage, startup apps, power plan, game FPS, or what to fix first. "
-                "I will ask before scanning and before running optimizer actions."
-            )
+
         if self.last_scan:
-            return self.performance_answer(metrics)
+            return self.no_topic_match_response()
         return (
             "I can answer general PC optimization questions, but for anything specific to this computer I need a read-only scan first. "
             "For slow performance, the usual first checks are CPU/GPU usage, RAM pressure, free disk space, startup apps, and the active power plan."
+        )
+
+    def is_unclear_prompt(self, lower_prompt: str) -> bool:
+        cleaned = re.sub(r"[^a-z0-9\s?]", " ", lower_prompt).strip()
+        if not cleaned:
+            return True
+        tokens = cleaned.split()
+        if len(tokens) == 1 and len(tokens[0]) <= 2 and tokens[0] not in ("hi", "yo"):
+            return True
+        random_chars = re.sub(r"[^a-z0-9]", "", cleaned)
+        if len(random_chars) <= 2 and "?" not in cleaned:
+            return True
+        return False
+
+    def is_greeting(self, lower_prompt: str) -> bool:
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", lower_prompt).strip()
+        return cleaned in ("hi", "hello", "hey", "yo", "sup")
+
+    def clarify_response(self) -> str:
+        return (
+            "I need a little more detail. Ask a specific question like:\n"
+            "- How much is my GPU being used?\n"
+            "- Why is my PC slow?\n"
+            "- What is using my RAM?\n"
+            "- Do I need to clean storage?\n"
+            "- What should I fix first?"
+        )
+
+    def capabilities_response(self) -> str:
+        mode = "online AI is available" if os.environ.get(OPENAI_API_KEY_ENV, "").strip() else "using local diagnostics"
+        return (
+            f"I can answer performance questions ({mode}). I can check or explain CPU, GPU, RAM, storage, startup apps, "
+            "power plan, FPS/lag, cache buildup, and scan findings. I will ask before scanning and before running any fix."
+        )
+
+    def no_topic_match_response(self) -> str:
+        return (
+            "I am not sure which performance area you mean. Ask about CPU, GPU, RAM, storage, startup apps, power plan, "
+            "game FPS, or ask 'what should I fix first?'"
         )
 
     def gpu_answer(self, metrics) -> str:

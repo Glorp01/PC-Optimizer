@@ -22,6 +22,10 @@ LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/lates
 WINDOWS_INSTALLER_ASSET = "PCOptimizer-Windows-Setup.exe"
 APP_EXECUTABLE_NAME = "PCOptimizer.exe"
 DEFAULT_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "Programs" / "PC Optimizer"
+OPENAI_RESPONSES_API = "https://api.openai.com/v1/responses"
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+OPENAI_MODEL_ENV = "PC_OPTIMIZER_AI_MODEL"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 BG = "#0b0b0b"
 FG = "#d0d0d0"
 ACCENT = "#16db65"  # terminal-ish green
@@ -440,6 +444,265 @@ def top_memory_processes(limit: int = 6):
     return processes[:limit]
 
 
+def cpu_status():
+    info = {"name": "", "load_percent": None, "cores": None, "logical_processors": None, "max_clock_mhz": None}
+    if not IS_WINDOWS:
+        return info
+    try:
+        res = run_hidden(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Processor | "
+                    "Select-Object -First 1 Name,LoadPercentage,NumberOfCores,"
+                    "NumberOfLogicalProcessors,MaxClockSpeed | ConvertTo-Json -Compress"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        raw = (res.stdout or "").strip()
+        if res.returncode != 0 or not raw:
+            return info
+        data = json.loads(raw)
+        info["name"] = str(data.get("Name") or "").strip()
+        info["load_percent"] = data.get("LoadPercentage")
+        info["cores"] = data.get("NumberOfCores")
+        info["logical_processors"] = data.get("NumberOfLogicalProcessors")
+        info["max_clock_mhz"] = data.get("MaxClockSpeed")
+    except Exception:
+        pass
+    return info
+
+
+def parse_nvidia_smi_value(value: str):
+    value = (value or "").strip()
+    if not value or value.upper() == "[N/A]":
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def gpu_status():
+    info = {"gpus": [], "overall_usage_percent": None, "source": "", "error": ""}
+    if not IS_WINDOWS:
+        return info
+
+    try:
+        res = run_hidden(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            for row in csv.reader(res.stdout.splitlines()):
+                if len(row) < 7:
+                    continue
+                gpu = {
+                    "name": row[0].strip(),
+                    "usage_percent": parse_nvidia_smi_value(row[1]),
+                    "memory_usage_percent": parse_nvidia_smi_value(row[2]),
+                    "memory_used": (parse_nvidia_smi_value(row[3]) or 0) * MIB,
+                    "memory_total": (parse_nvidia_smi_value(row[4]) or 0) * MIB,
+                    "temperature_c": parse_nvidia_smi_value(row[5]),
+                    "driver_version": row[6].strip(),
+                    "source": "nvidia-smi",
+                }
+                info["gpus"].append(gpu)
+            if info["gpus"]:
+                usages = [gpu["usage_percent"] for gpu in info["gpus"] if gpu.get("usage_percent") is not None]
+                if usages:
+                    info["overall_usage_percent"] = max(usages)
+                info["source"] = "nvidia-smi"
+                return info
+    except Exception:
+        pass
+
+    try:
+        res = run_hidden(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_VideoController | "
+                    "Select-Object Name,AdapterRAM,DriverVersion | ConvertTo-Json -Compress"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        raw = (res.stdout or "").strip()
+        if res.returncode == 0 and raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data = [data]
+            for item in data:
+                info["gpus"].append(
+                    {
+                        "name": str(item.get("Name") or "").strip(),
+                        "usage_percent": None,
+                        "memory_usage_percent": None,
+                        "memory_used": None,
+                        "memory_total": item.get("AdapterRAM"),
+                        "temperature_c": None,
+                        "driver_version": str(item.get("DriverVersion") or "").strip(),
+                        "source": "Win32_VideoController",
+                    }
+                )
+            if info["gpus"]:
+                info["source"] = "Win32_VideoController"
+    except Exception as exc:
+        info["error"] = str(exc)
+
+    try:
+        res = run_hidden(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' "
+                    "-ErrorAction SilentlyContinue).CounterSamples; "
+                    "$sum = ($samples | Where-Object { $_.InstanceName -match 'engtype_(3d|compute|copy|video)' } | "
+                    "Measure-Object -Property CookedValue -Sum).Sum; "
+                    "if ($null -ne $sum) { [math]::Round([math]::Min($sum, 100), 1) }"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        raw = (res.stdout or "").strip()
+        if res.returncode == 0 and raw:
+            info["overall_usage_percent"] = float(raw)
+    except Exception:
+        pass
+
+    return info
+
+
+def compact_scan_context(scan):
+    if not scan:
+        return {}
+    metrics = scan.get("metrics", {})
+    drive = metrics.get("drive") or {}
+    memory = metrics.get("memory") or {}
+    cpu = metrics.get("cpu") or {}
+    gpu = metrics.get("gpu") or {}
+    power = metrics.get("power_plan") or {}
+    startup = metrics.get("startup_items") or []
+    caches = sorted(metrics.get("caches") or [], key=lambda item: item.get("size", 0), reverse=True)
+
+    return {
+        "findings": [
+            {
+                "severity": finding.get("severity"),
+                "title": finding.get("title"),
+                "detail": finding.get("detail"),
+                "fix": finding.get("fix"),
+            }
+            for finding in scan.get("findings", [])[:6]
+        ],
+        "recommended_actions": [
+            ASSISTANT_ACTIONS[action]["label"]
+            for action in scan.get("actions", [])
+            if action in ASSISTANT_ACTIONS
+        ],
+        "drive": {
+            "path": drive.get("path"),
+            "free": humanize(drive.get("free", 0)) if drive else None,
+            "total": humanize(drive.get("total", 0)) if drive else None,
+            "free_percent": round(drive.get("free_percent", 0), 1) if drive else None,
+        },
+        "memory": {
+            "load_percent": memory.get("load_percent"),
+            "available": humanize(memory.get("available", 0)) if memory else None,
+            "total": humanize(memory.get("total", 0)) if memory else None,
+        },
+        "cpu": cpu,
+        "gpu": gpu,
+        "power_plan": power.get("name") or power.get("raw"),
+        "startup_count": len(startup),
+        "largest_caches": [
+            {
+                "name": cache.get("name"),
+                "size": humanize(cache.get("size", 0)),
+                "limited": cache.get("limited"),
+            }
+            for cache in caches[:5]
+        ],
+        "uptime_seconds": metrics.get("uptime_seconds"),
+    }
+
+
+def extract_response_text(response_data) -> str:
+    text = response_data.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    pieces = []
+    for output in response_data.get("output", []):
+        if output.get("type") != "message":
+            continue
+        for content in output.get("content", []):
+            if content.get("type") in ("output_text", "text"):
+                value = content.get("text")
+                if isinstance(value, str):
+                    pieces.append(value)
+    return "\n".join(piece.strip() for piece in pieces if piece.strip()).strip()
+
+
+def ask_openai_performance_assistant(prompt: str, scan, conversation):
+    api_key = os.environ.get(OPENAI_API_KEY_ENV, "").strip()
+    if not api_key:
+        return ""
+
+    model = os.environ.get(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    recent_history = conversation[-8:]
+    context = compact_scan_context(scan)
+    developer_prompt = (
+        "You are the AI Performance Assistant inside PC Optimizer. "
+        "Answer as a practical Windows PC optimization helper. "
+        "Use the provided diagnostic context when available, and say when a metric was not scanned. "
+        "Do not claim that a fix was applied. Any system-changing action requires explicit user approval in the app. "
+        "Keep answers concise, specific, and focused on diagnosing or improving PC performance."
+    )
+    user_payload = {
+        "user_question": prompt,
+        "pc_diagnostics": context,
+        "recent_conversation": recent_history,
+    }
+    payload = {
+        "model": model,
+        "input": [
+            {"role": "developer", "content": developer_prompt},
+            {"role": "user", "content": json.dumps(user_payload, indent=2)},
+        ],
+        "max_output_tokens": 700,
+    }
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_API,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "PC-Optimizer-AI",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        response_data = json.loads(response.read().decode("utf-8"))
+    return extract_response_text(response_data)
+
+
 def build_performance_scan():
     result = {
         "timestamp": time.time(),
@@ -590,6 +853,38 @@ def build_performance_scan():
                 "Review high-memory apps and use Clear RAM Cache only as a temporary refresh.",
                 "clear_ram",
             )
+
+    cpu = cpu_status()
+    result["metrics"]["cpu"] = cpu
+    cpu_load = cpu.get("load_percent")
+    if isinstance(cpu_load, (int, float)):
+        cpu_name = cpu.get("name") or "CPU"
+        if cpu_load >= 90:
+            add_finding(
+                "high",
+                "CPU load is very high",
+                f"{cpu_name} is currently around {cpu_load}% used. Sustained high CPU usage can cause lag, stutter, and slow app launches.",
+                "Close or uninstall the app causing the load, check startup apps, and use Task Manager for a per-process CPU view.",
+            )
+        elif cpu_load >= 75:
+            add_finding(
+                "medium",
+                "CPU load is elevated",
+                f"{cpu_name} is currently around {cpu_load}% used.",
+                "If the PC feels slow right now, identify the busy process in Task Manager before applying cleanup fixes.",
+            )
+
+    gpu = gpu_status()
+    result["metrics"]["gpu"] = gpu
+    gpu_usage = gpu.get("overall_usage_percent")
+    if isinstance(gpu_usage, (int, float)) and gpu_usage >= 90:
+        names = ", ".join(item.get("name", "GPU") for item in gpu.get("gpus", [])[:2]) or "GPU"
+        add_finding(
+            "medium",
+            "GPU load is very high",
+            f"{names} is currently around {gpu_usage}% used. High GPU usage is normal during games or rendering, but can lower desktop responsiveness.",
+            "Close GPU-heavy games, recording software, or browser tabs if this usage is unexpected.",
+        )
 
     power = active_power_plan()
     result["metrics"]["power_plan"] = power
@@ -1328,6 +1623,9 @@ class AIAssistantWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.last_scan = None
         self.scanning = False
+        self.responding = False
+        self.online_ai_allowed = None
+        self.conversation = []
 
         wrap = tk.Frame(self.window, bg=BG, highlightthickness=1, highlightbackground="#222")
         wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -1422,7 +1720,8 @@ class AIAssistantWindow:
         status.pack(anchor="w", pady=(8, 0))
 
         self.append_assistant(
-            "Ask what is slowing down the PC, or run a scan. I will ask before reading diagnostics and again before running any fix."
+            "Ask me about CPU, GPU, RAM, storage, startup apps, game performance, or what to fix. I will ask before reading diagnostics or running any fix.",
+            record=False,
         )
         self.prompt_entry.focus_set()
 
@@ -1433,11 +1732,15 @@ class AIAssistantWindow:
         self.chat.see(tk.END)
         self.chat.configure(state=tk.DISABLED)
 
-    def append_assistant(self, message: str) -> None:
+    def append_assistant(self, message: str, record: bool = True) -> None:
         self.append_message("AI", message, "assistant")
+        if record:
+            self.conversation.append({"role": "assistant", "content": message.strip()})
 
-    def append_user(self, message: str) -> None:
+    def append_user(self, message: str, record: bool = True) -> None:
         self.append_message("You", message, "user")
+        if record:
+            self.conversation.append({"role": "user", "content": message.strip()})
 
     def append_system(self, message: str) -> None:
         self.append_message("System", message, "system")
@@ -1446,14 +1749,23 @@ class AIAssistantWindow:
         self.scanning = scanning
         state = tk.DISABLED if scanning else tk.NORMAL
         self.scan_button.configure(state=state)
+        input_state = tk.DISABLED if scanning or self.responding else tk.NORMAL
+        self.send_button.configure(state=input_state)
+        self.prompt_entry.configure(state=input_state)
+        self.status_var.set("Scanning..." if scanning else "Ready")
+        self.update_fix_button()
+
+    def set_responding(self, responding: bool) -> None:
+        self.responding = responding
+        state = tk.DISABLED if responding or self.scanning else tk.NORMAL
         self.send_button.configure(state=state)
         self.prompt_entry.configure(state=state)
-        self.status_var.set("Scanning..." if scanning else "Ready")
+        self.status_var.set("Thinking..." if responding else "Ready")
         self.update_fix_button()
 
     def update_fix_button(self) -> None:
         has_actions = bool(self.last_scan and self.last_scan.get("actions"))
-        state = tk.NORMAL if has_actions and not self.scanning else tk.DISABLED
+        state = tk.NORMAL if has_actions and not self.scanning and not self.responding else tk.DISABLED
         self.fix_button.configure(state=state)
 
     def on_send(self, _event=None) -> None:
@@ -1468,22 +1780,7 @@ class AIAssistantWindow:
         lower = prompt.casefold()
         requested_actions = self.actions_from_prompt(lower)
         wants_action = any(word in lower for word in ("run", "apply", "fix", "clean", "clear", "enable", "switch", "start", "do it"))
-        wants_scan = any(
-            word in lower
-            for word in (
-                "scan",
-                "slow",
-                "slowing",
-                "performance",
-                "issue",
-                "wrong",
-                "bottleneck",
-                "diagnose",
-                "why",
-                "what should",
-                "what to fix",
-            )
-        )
+        explicit_scan = any(word in lower for word in ("scan", "diagnose", "diagnostic", "check my pc"))
 
         if requested_actions and wants_action:
             self.confirm_and_apply_actions(requested_actions)
@@ -1493,16 +1790,16 @@ class AIAssistantWindow:
             self.confirm_and_apply_actions(self.last_scan.get("actions", []))
             return
 
-        if wants_scan:
+        if explicit_scan:
             self.confirm_scan()
             return
 
-        if self.last_scan:
-            self.answer_from_scan(lower)
+        if self.prompt_needs_scan(lower) and not self.last_scan:
+            self.append_assistant("I need a read-only scan before I can answer that with your PC's actual numbers.", record=False)
+            self.confirm_scan()
             return
 
-        self.append_assistant("I need a read-only performance scan before I can give PC-specific advice.")
-        self.confirm_scan()
+        self.start_answer_worker(prompt)
 
     def actions_from_prompt(self, lower_prompt: str):
         actions = []
@@ -1527,6 +1824,282 @@ class AIAssistantWindow:
             add("startup_settings")
         return actions
 
+    def prompt_needs_scan(self, lower_prompt: str) -> bool:
+        system_topics = (
+            "my pc",
+            "my computer",
+            "my laptop",
+            "my gpu",
+            "my cpu",
+            "my ram",
+            "my memory",
+            "my disk",
+            "my drive",
+            "how much",
+            "usage",
+            "being used",
+            "why is it slow",
+            "what is wrong",
+            "what's wrong",
+            "bottleneck",
+            "lag",
+            "stutter",
+            "fps",
+            "temperature",
+            "temp",
+        )
+        metric_words = ("gpu", "cpu", "ram", "memory", "disk", "storage", "startup", "power plan")
+        return any(topic in lower_prompt for topic in system_topics) or (
+            "used" in lower_prompt and any(word in lower_prompt for word in metric_words)
+        )
+
+    def start_answer_worker(self, prompt: str) -> None:
+        if self.responding:
+            return
+        self.set_responding(True)
+        threading.Thread(target=self.answer_worker, args=(prompt,), daemon=True).start()
+
+    def answer_worker(self, prompt: str) -> None:
+        online_error = ""
+        answer = ""
+        try:
+            if self.should_use_online_ai():
+                try:
+                    answer = ask_openai_performance_assistant(prompt, self.last_scan, self.conversation)
+                except Exception as exc:
+                    online_error = str(exc)
+            if not answer:
+                answer = self.local_assistant_response(prompt)
+                if online_error:
+                    answer += f"\n\nOnline AI was unavailable, so I used local diagnostics instead. Error: {online_error}"
+        except Exception as exc:
+            answer = f"I could not answer that cleanly: {exc}"
+        self.post_ui(lambda answer=answer: self.answer_finished(answer))
+
+    def should_use_online_ai(self) -> bool:
+        if not os.environ.get(OPENAI_API_KEY_ENV, "").strip():
+            return False
+        if self.online_ai_allowed is True:
+            return True
+        if self.online_ai_allowed is False:
+            return False
+
+        accepted = False
+        done = threading.Event()
+
+        def ask_permission() -> None:
+            nonlocal accepted
+            try:
+                accepted = mb.askyesno(
+                    "Online AI",
+                    (
+                        "Use online AI for richer answers?\n\n"
+                        "This sends your question and a compact diagnostic summary to OpenAI. "
+                        "No optimizer action will run without a separate confirmation."
+                    ),
+                    parent=self.window,
+                )
+            except Exception:
+                accepted = False
+            finally:
+                done.set()
+
+        self.post_ui(ask_permission)
+        if not done.wait(120):
+            self.online_ai_allowed = False
+            return False
+        self.online_ai_allowed = accepted
+        return accepted
+
+    def answer_finished(self, answer: str) -> None:
+        self.set_responding(False)
+        self.append_assistant(answer)
+
+    def local_assistant_response(self, prompt: str) -> str:
+        lower = prompt.casefold()
+        metrics = self.last_scan.get("metrics", {}) if self.last_scan else {}
+
+        if "what is" in lower or "explain" in lower:
+            return self.explain_performance_term(lower)
+        if any(word in lower for word in ("gpu", "graphics", "vram")):
+            return self.gpu_answer(metrics)
+        if "cpu" in lower or "processor" in lower:
+            return self.cpu_answer(metrics)
+        if any(word in lower for word in ("ram", "memory")):
+            return self.memory_answer(metrics)
+        if any(word in lower for word in ("storage", "disk", "drive", "cache", "temp", "space")):
+            return self.storage_answer(metrics)
+        if "startup" in lower or "boot" in lower or "login" in lower:
+            return self.startup_answer(metrics)
+        if "power" in lower or "boost" in lower or "battery" in lower:
+            return self.power_answer(metrics)
+        if any(word in lower for word in ("game", "fps", "lag", "stutter", "slow", "bottleneck", "performance", "wrong")):
+            return self.performance_answer(metrics)
+        if "what can you do" in lower or "help" in lower:
+            return (
+                "I can help with PC performance questions, explain scan findings, and recommend fixes. "
+                "Ask about CPU, GPU, RAM, storage, startup apps, power plan, game FPS, or what to fix first. "
+                "I will ask before scanning and before running optimizer actions."
+            )
+        if self.last_scan:
+            return self.performance_answer(metrics)
+        return (
+            "I can answer general PC optimization questions, but for anything specific to this computer I need a read-only scan first. "
+            "For slow performance, the usual first checks are CPU/GPU usage, RAM pressure, free disk space, startup apps, and the active power plan."
+        )
+
+    def gpu_answer(self, metrics) -> str:
+        gpu = metrics.get("gpu") or {}
+        gpus = gpu.get("gpus") or []
+        if not gpu:
+            return "The last scan does not include GPU data. Run Scan PC again and I can check GPU usage, GPU name, VRAM, and temperature when Windows exposes it."
+        if not gpus and gpu.get("overall_usage_percent") is None:
+            return (
+                "I could not read GPU usage from Windows. If you have an NVIDIA card, installing/updating NVIDIA drivers usually provides `nvidia-smi`, "
+                "which lets the assistant read GPU usage more accurately."
+            )
+
+        lines = []
+        overall = gpu.get("overall_usage_percent")
+        if overall is not None:
+            lines.append(f"Current GPU usage is about {overall}%.")
+        for item in gpus:
+            name = item.get("name") or "GPU"
+            parts = [name]
+            if item.get("usage_percent") is not None:
+                parts.append(f"{item['usage_percent']}% core")
+            if item.get("memory_used") is not None and item.get("memory_total"):
+                parts.append(f"{humanize(item['memory_used'])} / {humanize(item['memory_total'])} VRAM")
+            elif item.get("memory_total"):
+                parts.append(f"{humanize(item['memory_total'])} VRAM")
+            if item.get("temperature_c") is not None:
+                parts.append(f"{item['temperature_c']} C")
+            lines.append("- " + ", ".join(parts))
+        if overall is None:
+            lines.append("Windows exposed the GPU model, but not live usage in this scan.")
+        elif overall >= 90:
+            lines.append("That is high. It is normal while gaming/rendering, but unexpected high usage can mean a game, browser tab, recorder, or overlay is using the GPU.")
+        elif overall >= 40:
+            lines.append("That is moderate. It can be normal with games, video playback, browser acceleration, or desktop effects.")
+        else:
+            lines.append("That is low, so the GPU is probably not the main bottleneck right now.")
+        return "\n".join(lines)
+
+    def cpu_answer(self, metrics) -> str:
+        cpu = metrics.get("cpu") or {}
+        if not cpu:
+            return "The last scan does not include CPU data. Run Scan PC again and I can check current CPU load."
+        name = cpu.get("name") or "CPU"
+        load = cpu.get("load_percent")
+        details = []
+        if cpu.get("cores") and cpu.get("logical_processors"):
+            details.append(f"{cpu['cores']} cores / {cpu['logical_processors']} threads")
+        if cpu.get("max_clock_mhz"):
+            details.append(f"up to {cpu['max_clock_mhz']} MHz")
+        suffix = f" ({', '.join(details)})" if details else ""
+        if load is None:
+            return f"{name}{suffix}. Windows did not report a live CPU usage number in the scan."
+        if load >= 90:
+            advice = "That is very high. Open Task Manager and sort by CPU to find the process before applying cleanup fixes."
+        elif load >= 75:
+            advice = "That is elevated. If the PC feels slow, a busy foreground app or startup/background app may be the cause."
+        else:
+            advice = "That is not high enough by itself to explain major slowdowns right now."
+        return f"{name}{suffix} is currently around {load}% used. {advice}"
+
+    def memory_answer(self, metrics) -> str:
+        memory = metrics.get("memory") or {}
+        processes = metrics.get("top_memory_processes") or []
+        if not memory:
+            return "I could not read memory pressure from the last scan."
+        lines = [
+            f"Memory is {memory['load_percent']}% used with {humanize(memory['available'])} available out of {humanize(memory['total'])}."
+        ]
+        if processes:
+            lines.append("Largest visible memory users:")
+            for proc in processes[:5]:
+                lines.append(f"- {proc['name']} (PID {proc['pid']}): {humanize(proc['memory'])}")
+        if memory["load_percent"] >= 85:
+            lines.append("That is high. Close heavy apps first; Clear RAM Cache is only a temporary refresh.")
+        elif memory["load_percent"] >= 75:
+            lines.append("That is somewhat tight. Startup apps and browser tabs are common causes.")
+        else:
+            lines.append("RAM pressure does not look like the main issue right now.")
+        return "\n".join(lines)
+
+    def storage_answer(self, metrics) -> str:
+        drive = metrics.get("drive") or {}
+        caches = sorted(metrics.get("caches") or [], key=lambda item: item.get("size", 0), reverse=True)
+        lines = []
+        if drive:
+            lines.append(
+                f"{drive['path']} has {humanize(drive['free'])} free out of {humanize(drive['total'])} ({drive['free_percent']:.1f}% free)."
+            )
+        if caches:
+            lines.append("Largest cache areas from the last scan:")
+            for cache in caches[:5]:
+                limited = " or more" if cache.get("limited") else ""
+                lines.append(f"- {cache['name']}: {humanize(cache['size'])}{limited}")
+        if drive and drive.get("free_percent", 100) <= 15:
+            lines.append("Low free space can slow updates, paging, and app launches. Use Optimize & Clean, then Storage Manager for large personal files.")
+        else:
+            lines.append("Best fix: clean ordinary temp files first, then use Storage Manager if you need to find large files.")
+        return "\n".join(lines)
+
+    def startup_answer(self, metrics) -> str:
+        startup = metrics.get("startup_items") or []
+        lines = [f"The last scan found {len(startup)} startup entries."]
+        for item in startup[:8]:
+            lines.append(f"- {item['name']} ({item['location']})")
+        if len(startup) >= 18:
+            lines.append("That is a lot. Open Startup Apps settings and disable anything you do not need immediately after login.")
+        elif len(startup) >= 10:
+            lines.append("This is worth reviewing if boot or login feels slow.")
+        else:
+            lines.append("Startup apps do not look excessive from this scan.")
+        return "\n".join(lines)
+
+    def power_answer(self, metrics) -> str:
+        power = metrics.get("power_plan") or {}
+        plan = power.get("name") or power.get("raw") or "unknown"
+        lower_plan = plan.casefold()
+        if "high performance" in lower_plan or "ultimate performance" in lower_plan:
+            return f"The active power plan is {plan}. That is already performance-focused."
+        return (
+            f"The active power plan is {plan}. Balanced or saver plans can reduce CPU responsiveness. "
+            "Boost Performance can switch to a performance-focused plan after you approve it."
+        )
+
+    def performance_answer(self, metrics) -> str:
+        if not self.last_scan:
+            return "Run Scan PC first and I can tell you what looks wrong on this computer."
+        findings = self.last_scan.get("findings", [])
+        if not findings:
+            return "The last scan did not find a clear bottleneck. Ask about CPU, GPU, RAM, storage, startup apps, or power plan for a more specific check."
+        lines = ["Most likely performance issues from the last scan:"]
+        for finding in findings[:4]:
+            lines.append(f"- {finding.get('title')}: {finding.get('detail')}")
+            if finding.get("fix"):
+                lines.append(f"  Fix: {finding['fix']}")
+        actions = self.last_scan.get("actions", [])
+        if actions:
+            labels = ", ".join(ASSISTANT_ACTIONS[action]["label"] for action in actions if action in ASSISTANT_ACTIONS)
+            lines.append(f"I can start these after you approve: {labels}.")
+        return "\n".join(lines)
+
+    def explain_performance_term(self, lower_prompt: str) -> str:
+        if "gpu" in lower_prompt:
+            return "A GPU handles graphics and some compute work. High GPU usage is normal in games, rendering, or video work; unexpected high usage can come from overlays, browsers, recorders, or background apps."
+        if "cpu" in lower_prompt:
+            return "A CPU runs general app and system work. High CPU usage can make the whole PC feel slow, especially if one process is stuck or startup apps are busy."
+        if "ram" in lower_prompt or "memory" in lower_prompt:
+            return "RAM is short-term working memory. When it gets full, Windows uses the disk more, which can cause stutter and slow switching between apps."
+        if "power plan" in lower_prompt:
+            return "A Windows power plan controls how aggressively the CPU boosts and saves power. Balanced is usually fine, but High or Ultimate Performance can improve responsiveness while plugged in."
+        if "cache" in lower_prompt:
+            return "Caches are temporary files used to speed things up. They are normal, but large or stale caches can waste storage and sometimes cause update or app issues."
+        return "I can explain PC performance terms like CPU, GPU, RAM, VRAM, cache, startup apps, power plans, and bottlenecks."
+
     def confirm_scan(self) -> None:
         if self.scanning:
             self.append_assistant("A scan is already running.")
@@ -1538,8 +2111,8 @@ class AIAssistantWindow:
             "AI Performance Scan",
             (
                 "Run a read-only performance scan?\n\n"
-                "I will check drive free space, temp/cache sizes, active power plan, memory pressure, "
-                "startup entries, uptime, and the largest visible memory users.\n\n"
+                "I will check drive free space, temp/cache sizes, CPU load, GPU details/usage when available, "
+                "active power plan, memory pressure, startup entries, uptime, and the largest visible memory users.\n\n"
                 "No files will be deleted and no settings will be changed."
             ),
             parent=self.window,
@@ -1579,7 +2152,7 @@ class AIAssistantWindow:
 
     def format_scan_report(self, result) -> str:
         lines = [
-            "I scanned storage, temp/cache folders, memory pressure, the power plan, startup entries, uptime, and high-memory processes."
+            "I scanned storage, temp/cache folders, CPU load, GPU details/usage when available, memory pressure, the power plan, startup entries, uptime, and high-memory processes."
         ]
         for finding in result.get("findings", []):
             lines.append("")
@@ -1597,60 +2170,6 @@ class AIAssistantWindow:
             lines.append("")
             lines.append("No automatic optimizer action is required from this scan.")
         return "\n".join(lines)
-
-    def answer_from_scan(self, lower_prompt: str) -> None:
-        metrics = self.last_scan.get("metrics", {}) if self.last_scan else {}
-        if any(word in lower_prompt for word in ("ram", "memory")):
-            memory = metrics.get("memory") or {}
-            processes = metrics.get("top_memory_processes") or []
-            if not memory:
-                self.append_assistant("I could not read memory pressure from the last scan.")
-                return
-            lines = [
-                f"Memory is {memory['load_percent']}% used with {humanize(memory['available'])} available out of {humanize(memory['total'])}."
-            ]
-            if processes:
-                lines.append("Largest visible memory users:")
-                for proc in processes[:5]:
-                    lines.append(f"- {proc['name']} (PID {proc['pid']}): {humanize(proc['memory'])}")
-            lines.append("Best fix: close heavy apps first; use Clear RAM Cache only as a temporary refresh.")
-            self.append_assistant("\n".join(lines))
-            return
-
-        if any(word in lower_prompt for word in ("storage", "disk", "drive", "cache", "temp")):
-            drive = metrics.get("drive") or {}
-            caches = sorted(metrics.get("caches") or [], key=lambda item: item.get("size", 0), reverse=True)
-            lines = []
-            if drive:
-                lines.append(
-                    f"{drive['path']} has {humanize(drive['free'])} free out of {humanize(drive['total'])} ({drive['free_percent']:.1f}% free)."
-                )
-            if caches:
-                lines.append("Largest cache areas from the last scan:")
-                for cache in caches[:5]:
-                    lines.append(f"- {cache['name']}: {humanize(cache['size'])}")
-            lines.append("Best fix: run Optimize & Clean for ordinary temp files, then use Storage Manager for large personal files.")
-            self.append_assistant("\n".join(lines))
-            return
-
-        if "power" in lower_prompt or "boost" in lower_prompt:
-            power = metrics.get("power_plan") or {}
-            plan = power.get("name") or power.get("raw") or "unknown"
-            self.append_assistant(
-                f"The last scan saw this active power plan: {plan}. If it is Balanced or a saver plan, Boost Performance can switch to a performance-focused plan after you approve."
-            )
-            return
-
-        if "startup" in lower_prompt or "boot" in lower_prompt:
-            startup = metrics.get("startup_items") or []
-            lines = [f"The last scan found {len(startup)} startup entries."]
-            for item in startup[:8]:
-                lines.append(f"- {item['name']} ({item['location']})")
-            lines.append("Best fix: open Startup Apps settings and disable items you do not need at login.")
-            self.append_assistant("\n".join(lines))
-            return
-
-        self.append_assistant(self.format_scan_report(self.last_scan))
 
     def on_apply_recommended(self) -> None:
         if not self.last_scan:

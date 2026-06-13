@@ -68,6 +68,60 @@ ASSISTANT_ACTIONS = {
     },
 }
 
+OPTIMIZER_OPTION_HELP = [
+    (
+        "Optimize & Clean",
+        "Clears user temp files, Windows temp files, Recent items, and the Recycle Bin. "
+        "This is the normal cleanup option for freeing disk space from everyday junk.",
+    ),
+    (
+        "Boost Performance",
+        "Switches Windows to Ultimate Performance or High performance when available, "
+        "then sets plugged-in CPU max performance to 100%. This can improve responsiveness "
+        "but may use more power and create more heat.",
+    ),
+    (
+        "Open Temp Folder",
+        "Opens your user temp folder so you can inspect temporary files yourself. It does not "
+        "delete anything automatically.",
+    ),
+    (
+        "Storage Manager",
+        "Opens the built-in storage scanner to find large files and folders. It only deletes "
+        "files after you select them and confirm.",
+    ),
+    (
+        "Update App",
+        "Checks GitHub for the latest PC Optimizer release and offers to install it when an "
+        "update is available.",
+    ),
+    (
+        "AI Assistant",
+        "Opens a PC performance helper that can explain scan results and suggest fixes. It asks "
+        "before reading diagnostics or running optimizer actions.",
+    ),
+    (
+        "Aggressive Clean",
+        "With confirmation, clears deeper Windows caches such as Windows Update downloads, "
+        "Delivery Optimization, thumbnails, Windows Error Reporting, and Prefetch. Some parts "
+        "may need admin rights and Windows can rebuild these caches later.",
+    ),
+    (
+        "Revert Boost",
+        "Switches Windows back to the Balanced power plan after using Boost Performance.",
+    ),
+    (
+        "Clear RAM Cache",
+        "Trims process working sets as a temporary memory refresh. It can help in some cases, "
+        "but closing heavy apps is usually the better long-term fix.",
+    ),
+    (
+        "Component Cleanup",
+        "With confirmation, runs DISM component store cleanup to remove superseded Windows "
+        "update components. It can take several minutes and may require admin rights.",
+    ),
+]
+
 APP_VERSION = "0.0.0-dev"
 try:
     from _build_info import APP_VERSION as APP_VERSION
@@ -2284,6 +2338,7 @@ class PCOptimizerApp:
         self.latest_update_release = None
         self.latest_update_asset = None
         self.latest_update_tag = ""
+        self.option_help_window = None
         root.title(APP_TITLE)
         root.configure(bg=BG)
         try:
@@ -2318,14 +2373,32 @@ class PCOptimizerApp:
         self.wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # Header
+        header_frame = tk.Frame(self.wrap, bg=BG)
+        header_frame.pack(fill=tk.X)
+
         self.header = tk.Label(
-            self.wrap,
+            header_frame,
             text="> PC Optimizer",
             bg=BG,
             fg=ACCENT,
             font=HEADER_FONT,
         )
-        self.header.pack(anchor="w")
+        self.header.pack(side=tk.LEFT, anchor="w")
+
+        self.btn_option_help = tk.Button(
+            header_frame,
+            text="Option Help",
+            command=self.show_option_help,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=4,
+        )
+        self.btn_option_help.pack(side=tk.RIGHT)
 
         # Controls
         btn_frame = tk.Frame(self.wrap, bg=BG)
@@ -2562,6 +2635,97 @@ class PCOptimizerApp:
         self.btn_revert.configure(state=state)
         self.btn_clear_ram.configure(state=state)
         self.btn_component_cleanup.configure(state=state)
+
+    def show_option_help(self) -> None:
+        try:
+            if self.option_help_window and self.option_help_window.winfo_exists():
+                self.option_help_window.lift()
+                self.option_help_window.focus_force()
+                return
+        except tk.TclError:
+            self.option_help_window = None
+
+        win = tk.Toplevel(self.root)
+        self.option_help_window = win
+        win.title("Optimizer Option Help")
+        win.configure(bg=BG)
+        win.geometry("760x500")
+        win.minsize(620, 380)
+        try:
+            win.attributes("-alpha", 1.0)
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        def close_help() -> None:
+            self.option_help_window = None
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        win.protocol("WM_DELETE_WINDOW", close_help)
+
+        wrap = tk.Frame(win, bg=BG, highlightthickness=1, highlightbackground="#222")
+        wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        tk.Label(
+            wrap,
+            text="> What Each Option Does",
+            bg=BG,
+            fg=ACCENT,
+            font=HEADER_FONT,
+        ).pack(anchor="w")
+
+        tk.Label(
+            wrap,
+            text="These are descriptions only. Nothing runs from this help window.",
+            bg=BG,
+            fg="#808080",
+            font=("Consolas", 9),
+        ).pack(anchor="w", pady=(4, 8))
+
+        text_frame = tk.Frame(wrap, bg=BG)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        scroll = tk.Scrollbar(text_frame)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        help_text = tk.Text(
+            text_frame,
+            bg="#0f0f0f",
+            fg=FG,
+            insertbackground=ACCENT,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=8,
+            pady=8,
+            wrap=tk.WORD,
+            yscrollcommand=scroll.set,
+        )
+        help_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.configure(command=help_text.yview)
+
+        lines = []
+        for label, description in OPTIMIZER_OPTION_HELP:
+            lines.append(f"{label}\n  {description}")
+        help_text.insert(tk.END, "\n\n".join(lines))
+        help_text.configure(state=tk.DISABLED)
+
+        close_button = tk.Button(
+            wrap,
+            text="Close",
+            command=close_help,
+            bg="#111",
+            fg=FG,
+            activebackground="#1a1a1a",
+            activeforeground=FG,
+            font=FONT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        )
+        close_button.pack(anchor="e", pady=(8, 0))
 
     def require_windows(self, action_name: str) -> bool:
         if IS_WINDOWS:

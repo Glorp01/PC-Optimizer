@@ -11,6 +11,7 @@ A small Windows utility with a terminal-style Tkinter UI for cleaning temporary 
 - Component Cleanup: runs `dism /Online /Cleanup-Image /StartComponentCleanup`.
 - Storage Manager: select a drive, scan folder contents, sort largest to smallest, drill into folders, open locations, and move selected items to the Recycle Bin.
 - AI Assistant: ask performance questions, run a read-only diagnostic scan, review likely bottlenecks, and approve or deny recommended optimizer actions. It answers from local diagnostics by default and can use online AI when `OPENAI_API_KEY` is set; override the model with `PC_OPTIMIZER_AI_MODEL`.
+- Option Help: opens an in-app reference that explains what each optimizer button does before users run anything.
 - Update App: checks the latest GitHub Release, downloads the newest Windows installer, and launches it.
 - Live UI log: shows progress and any skipped operations while tasks run.
 
@@ -65,11 +66,11 @@ Push this repository to GitHub with the included workflow. Every push to `main` 
 
 To create a public GitHub Release with the installer and zip files attached, push a version tag:
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.9
+git push origin v0.1.9
 ```
 
-After the workflow finishes, the files will be attached to the `v0.1.0` release.
+After the workflow finishes, the files will be attached to the `v0.1.9` release. Use a higher tag number for later updates.
 
 ## In-App Updates
 Installed Windows copies include an `Update App` button. It checks the latest GitHub Release for `PCOptimizer-Windows-Setup.exe`; if the release tag is newer than the installed version, it downloads the installer, applies it silently in the background, closes PC Optimizer, and relaunches it when the update finishes.

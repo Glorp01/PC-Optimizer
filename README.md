@@ -66,11 +66,11 @@ Push this repository to GitHub with the included workflow. Every push to `main` 
 
 To create a public GitHub Release with the installer and zip files attached, push a version tag:
 ```powershell
-git tag v0.1.9
-git push origin v0.1.9
+git tag v0.1.10
+git push origin v0.1.10
 ```
 
-After the workflow finishes, the files will be attached to the `v0.1.9` release. Use a higher tag number for later updates.
+After the workflow finishes, the files will be attached to the `v0.1.10` release. Use a higher tag number for later updates.
 
 ## In-App Updates
 Installed Windows copies include an `Update App` button. It checks the latest GitHub Release for `PCOptimizer-Windows-Setup.exe`; if the release tag is newer than the installed version, it downloads the installer, applies it silently in the background, closes PC Optimizer, and relaunches it when the update finishes.
@@ -78,6 +78,8 @@ Installed Windows copies include an `Update App` button. It checks the latest Gi
 The button fades when the installed version is current and switches to a brighter update style when a newer release is available.
 
 Each PC updates itself when the user presses the button. GitHub cannot force-update already installed copies remotely, and versions installed before the updater was added need one manual install of the newer release first.
+
+If an installed copy reports `CERTIFICATE_VERIFY_FAILED` while checking GitHub, install the latest `PCOptimizer-Windows-Setup.exe` manually from the release page once. Newer builds include a bundled certificate fallback for future update checks.
 
 ## Notes
 - Some operations are best-effort and may skip locked files or protected system resources.

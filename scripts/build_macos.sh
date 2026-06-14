@@ -20,6 +20,7 @@ python3 -m PyInstaller \
   --clean \
   --windowed \
   --name PCOptimizer \
+  --collect-data certifi \
   --specpath build \
   main.py
 

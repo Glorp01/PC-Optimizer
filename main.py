@@ -9,6 +9,7 @@ import ctypes
 import csv
 import json
 import re
+import ssl
 import urllib.error
 import urllib.request
 from ctypes import wintypes as wt
@@ -19,6 +20,7 @@ from tkinter import messagebox as mb, ttk
 APP_TITLE = "PC Optimizer Panel"
 GITHUB_REPO = "Glorp01/PC-Optimizer"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+LATEST_RELEASE_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
 WINDOWS_INSTALLER_ASSET = "PCOptimizer-Windows-Setup.exe"
 APP_EXECUTABLE_NAME = "PCOptimizer.exe"
 DEFAULT_INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "Programs" / "PC Optimizer"
@@ -143,6 +145,38 @@ def popen_hidden(args, **kwargs):
     return subprocess.Popen(args, **kwargs)
 
 
+def is_certificate_verify_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return (
+        "certificate_verify_failed" in text
+        or "certificate verify failed" in text
+        or "unable to get local issuer certificate" in text
+    )
+
+
+def bundled_ca_context():
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+
+def trusted_urlopen(request, timeout: int):
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except (urllib.error.URLError, ssl.SSLError) as first_error:
+        if not is_certificate_verify_error(first_error):
+            raise
+
+        context = bundled_ca_context()
+        if context is None:
+            raise
+
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+
+
 def github_request_json(url: str):
     request = urllib.request.Request(
         url,
@@ -151,7 +185,7 @@ def github_request_json(url: str):
             "User-Agent": "PC-Optimizer-Updater",
         },
     )
-    with urllib.request.urlopen(request, timeout=25) as response:
+    with trusted_urlopen(request, timeout=25) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -752,7 +786,7 @@ def ask_openai_performance_assistant(prompt: str, scan, conversation):
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=45) as response:
+    with trusted_urlopen(request, timeout=45) as response:
         response_data = json.loads(response.read().decode("utf-8"))
     return extract_response_text(response_data)
 
@@ -2891,11 +2925,14 @@ class PCOptimizerApp:
                 self.root.after(0, lambda: self.prompt_update_install(release, asset, latest_tag))
             else:
                 self.write(f"> Update available: {latest_tag}")
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, ssl.SSLError) as e:
             self.set_update_button_state("unknown")
             if show_dialog:
-                self.write(f"[!] Update check failed: {e}")
-                self.show_message("Update App", f"Could not reach GitHub:\n{e}", "error")
+                message = self.format_update_network_error(e)
+                self.write(f"[!] Update check failed: {message}")
+                if is_certificate_verify_error(e):
+                    self.write(f"> Manual install page: {LATEST_RELEASE_PAGE}")
+                self.show_message("Update App", message, "error")
         except Exception as e:
             self.set_update_button_state("unknown")
             if show_dialog:
@@ -2954,8 +2991,14 @@ class PCOptimizerApp:
             )
             self.root.after(600, self.root.destroy)
         except Exception as e:
-            self.write(f"[!] Update install failed: {e}")
-            self.show_message("Update App", f"Update install failed:\n{e}", "error")
+            if is_certificate_verify_error(e):
+                message = self.format_update_network_error(e)
+                self.write(f"[!] Update install failed: {message}")
+                self.write(f"> Manual install page: {LATEST_RELEASE_PAGE}")
+            else:
+                message = f"Update install failed:\n{e}"
+                self.write(f"[!] Update install failed: {e}")
+            self.show_message("Update App", message, "error")
             self.root.after(0, lambda: self.set_buttons_enabled(True))
             self.root.after(0, self.stop_progress)
 
@@ -2999,7 +3042,7 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
             download_url,
             headers={"User-Agent": "PC-Optimizer-Updater"},
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with trusted_urlopen(request, timeout=60) as response:
             total = int(response.headers.get("Content-Length") or 0)
             downloaded = 0
             next_log = 5 * 1024 * 1024
@@ -3016,6 +3059,17 @@ if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $AppExe)) {{
                         else:
                             self.write(f"  downloaded {humanize(downloaded)}")
                         next_log += 5 * 1024 * 1024
+
+    def format_update_network_error(self, error: BaseException) -> str:
+        if is_certificate_verify_error(error):
+            return (
+                "Could not verify GitHub's HTTPS certificate.\n\n"
+                "PC Optimizer retried with a bundled certificate bundle, but verification still failed. "
+                "This is usually caused by outdated Windows root certificates, a filtered school/work network, "
+                "or antivirus/proxy HTTPS inspection.\n\n"
+                f"Manual install page:\n{LATEST_RELEASE_PAGE}"
+            )
+        return f"Could not reach GitHub:\n{error}"
 
     def show_message(self, title: str, message: str, level: str = "info") -> None:
         def show() -> None:

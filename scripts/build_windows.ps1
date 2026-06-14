@@ -23,6 +23,7 @@ python -m PyInstaller `
     --onedir `
     --windowed `
     --name PCOptimizer `
+    --collect-data certifi `
     --specpath build `
     main.py
 
